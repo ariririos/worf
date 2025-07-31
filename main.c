@@ -51,11 +51,9 @@ void get_all_mpd_songs(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bl
 void get_all_songs_since_timestamp(struct mpd_connection *conn, struct timespec *timestamp, sqlite3 *mpd_db, sqlite3 *bliss_db);
 bool check_for_dup(struct mpd_connection *conn, DatabaseEntity *db_entity, sqlite3 *mpd_db);
 bool add_to_mpd_db(DatabaseEntity *db_entity, sqlite3 *mpd_db, sqlite3 *bliss_db);
-char *replace_all(char *str, const char *substr, const char *replacement);
 int get_song_id(DatabaseEntity *db_entity, sqlite3 *bliss_db);
 
 static int clear_callback(void *_, int argc, char **argv, char **col_name) {
-  printf("mpd.db cleared\n");
   return 0;
 }
 
