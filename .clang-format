@@ -1,0 +1,7 @@
+BasedOnStyle: LLVM
+ColumnLimit: 0
+BreakBeforeBraces: Custom
+BraceWrapping:
+    BeforeElse: true
+ReflowComments: false
+Cpp11BracedListStyle: false
