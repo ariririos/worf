@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <errno.h>
+#include <getopt.h>
 #include <mpd/client.h>
 #include <sqlite3.h>
 #include <stddef.h>
@@ -7,34 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdarg.h>
+#include <math.h>
+#include "isotree/include/isotree_c.h"
+#include <callback.h>
 #define NUM_FEATURES 20
-// #define DEBUG 
-
-const char *MPD_MUSIC_DIR =
-    "/media/aririos/Files/zotify/"; // TODO: use mpd_send_list_mounts to retrieve
-int mpd_total = 0;
-int mpd_songs_total = 0;
 
 typedef struct {
-  enum mpd_entity_type type;
-  time_t mtime;
-  time_t atime;
   char *path;
   int song_id;
-} DatabaseEntity;
-
-typedef struct {
-  int argc;
-  char **argv;
-  char **col_name;
-} MPDDatabaseResponse;
-
-typedef struct {
-  int *i;
-  struct mpd_connection *conn;
-  sqlite3 *bliss_db;
-  sqlite3 *mpd_db;
-} VerifySongController;
+} db_song;
 
 enum BLISS_FEATURES {
   TEMPO,
@@ -59,24 +42,40 @@ enum BLISS_FEATURES {
   CHROMA_INTERVAL_TEN
 };
 
+typedef struct {
+  int song_id;
+  double features[NUM_FEATURES];
+} bliss_analysis;
+
+typedef struct {
+  sqlite3 *bliss_db;
+  int max_song_id;
+  bliss_analysis *(*library)[];
+} library_controller;
+
+typedef struct {
+  int i;
+  char *music_dir;
+  db_song **songs;
+} random_query_controller;
+
 bool int_in_arr(int needle, int *haystack, size_t len);
 int str_pos_in_arr(char *needle, char **haystack, size_t len);
 char *replace_all(char *str, const char *substr, const char *replacement);
-static int clear_callback(void *_, int argc, char **argv, char **col_name);
-static int dup_callback(void *dup_found, int argc, char **argv, char **col_name);
-static int song_id_callback(void *song_id, int argc, char **argv, char **col_name);
-static int song_query_callback(void *db_entity, int argc, char **argv, char **col_name);
-static int verify_song_callback(void *controller, int argc, char **argv, char **col_name);
-void get_all_mpd_songs(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss_db);
-void get_all_songs_since_timestamp(struct mpd_connection *conn, struct timespec *timestamp, sqlite3 *mpd_db, sqlite3 *bliss_db);
-bool check_for_dup(struct mpd_connection *conn, DatabaseEntity *db_entity, sqlite3 *mpd_db);
-bool add_to_mpd_db(DatabaseEntity *db_entity, sqlite3 *mpd_db, sqlite3 *bliss_db);
-int get_song_id(DatabaseEntity *db_entity, sqlite3 *bliss_db);
-int random_playlist(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss_db, size_t playlist_len);
-void db_entities_free(DatabaseEntity **db_entities, size_t len);
-int add_mpd_db_songs_from_bliss_db(VerifySongController *controller, int mpd_db_id, MPDDatabaseResponse *db_response);
-int verify_mpd_db_song_against_bliss_db(VerifySongController *controller, int mpd_db_id, MPDDatabaseResponse *db_response);
-int verify_mpd_db(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss_db);
+double euclidean_distance(double *a, double *b, int dimensions);
+void euclidean_distance_callback(void *center, va_alist alist);
+bool strtol_err_wrap(char *str, int *output);
+bool get_int_by_column_name(char *col_name, int argc, char **argv, char **col_names, int *val);
+int song_id_callback(void *song_id, int argc, char **argv, char **col_name);
+int song_query_callback(void *song_ptr, int argc, char **argv, char **col_name);
+int verify_song_callback(void *controller, int argc, char **argv, char **col_name);
+int bliss_library_callback(void *library, int argc, char **argv, char **col_name);
+int bliss_analysis_callback(void *analysis, int argc, char **argv, char **col_name);
+int get_song_id(db_song *db_song, sqlite3 *bliss_db, char *mpd_music_dir);
+int random_playlist(struct mpd_connection *conn, sqlite3 *bliss_db, size_t playlist_len, char *music_dir);
+void db_songs_free(size_t len, db_song *db_songs[len], size_t start);
+int get_bliss_analysis_features(sqlite3* bliss_db, int song_id, bliss_analysis *analysis);
+int get_bliss_library(sqlite3* bliss_db, int max_song_id, bliss_analysis *(*library)[max_song_id + 1]);
 
 bool int_in_arr(int needle, int *haystack, size_t len) {
   for (size_t i = 0; i < len; i++) {
@@ -94,7 +93,7 @@ int str_pos_in_arr(char *needle, char **haystack, size_t len) {
     }
   }
   return -1;
-} 
+}
 
 char *replace_all(char *str, const char *substr, const char *replacement) {
   if (strcmp(str, "") == 0 || strcmp(substr, "") == 0) {
@@ -152,275 +151,135 @@ char *replace_all(char *str, const char *substr, const char *replacement) {
   return out;
 }
 
-static int clear_callback(void *_, int argc, char **argv, char **col_name) {
-  return 0;
+double euclidean_distance(double *a, double *b, int dimensions) {
+  double sum = 0.0;
+  for (int i = 0; i < dimensions; i++) {
+    sum += pow(a[i] - b[i], 2);
+  }
+  return sqrt(sum);
 }
 
-static int dup_callback(void *dup_found, int argc, char **argv, char **col_name) {
-  bool *dup_found_ptr = dup_found;
-  *dup_found_ptr = true;
-  return 0;
+void euclidean_distance_callback(void *center, va_alist alist) {
+  bliss_analysis *center_ptr = center;
+  va_start_ptr(alist, int);
+  bliss_analysis **a_ptr = va_arg_ptr(alist, bliss_analysis**);
+  if (a_ptr == NULL) { 
+    fprintf(stderr, "Not enough arguments provided to euclidean_distance_callback: expected 2, got 0\n");
+    exit(1);
+  }
+  bliss_analysis **b_ptr = va_arg_ptr(alist, bliss_analysis**);
+  if (b_ptr == NULL) { 
+    fprintf(stderr, "Not enough arguments provided to euclidean_distance_callback: expected 2, got 1\n");
+    exit(1);
+  }
+  bliss_analysis *a = *a_ptr;
+  bliss_analysis *b = *b_ptr;
+  double distance_a = euclidean_distance(center_ptr->features, a->features, NUM_FEATURES);
+  double distance_b = euclidean_distance(center_ptr->features, b->features, NUM_FEATURES);
+  double diff = distance_a - distance_b;
+  if (fabs(diff) < 0.05) {
+    va_return_ptr(alist, int, 0);
+  }
+  else {
+    va_return_ptr(alist, int, diff > 0 ? 1 : -1 );
+  }
 }
 
-static int song_id_callback(void *song_id, int argc, char **argv, char **col_name) {
+bool strtol_err_wrap(char *str, int *output) {
   char *end_ptr;
   errno = 0;
-  int *song_id_ptr = song_id;
-  int id_col_pos = str_pos_in_arr("id", col_name, argc);
-  if (id_col_pos == -1) {
-    fprintf(stderr, "id column not found at song_id_callback\n");
-    return 1;
+  *output = strtol(str, &end_ptr, 10);
+  if (errno == ERANGE || *end_ptr != '\0' || end_ptr == str) {
+    fprintf(stderr, "strtol_err_wrap failed with argument %s", str);
+    return false;
   }
-  *song_id_ptr = strtol(argv[id_col_pos], &end_ptr, 10);
-  if (errno == ERANGE || *end_ptr != '\0' || end_ptr == argv[0]) {
-    fprintf(stderr, "strtol failed at song_id_callback\n");
-    return 1;
-  }
-  return 0;
+  return true;
 }
 
-static int song_query_callback(void *db_entity, int argc, char **argv, char **col_name) {
-  DatabaseEntity *db_entity_ptr = db_entity;
+bool get_int_by_column_name(char *col_name, int argc, char **argv, char **col_names, int *val) {
+  int col_pos = str_pos_in_arr(col_name, col_names, argc);
+  if (col_pos == -1) {
+    fprintf(stderr, "%s column not found at get_int_by_column_name\n", col_name);
+    return false;
+  }
+  return strtol_err_wrap(argv[col_pos], val);
+}
+
+int song_id_callback(void *song_id, int argc, char **argv, char **col_name) {
+  int *song_id_ptr = song_id;
+  return !get_int_by_column_name("id", argc, argv, col_name, song_id_ptr);
+}
+
+int song_query_callback(void *song_ptr, int argc, char **argv, char **col_name) {
+  db_song *song = song_ptr;
   int path_col_pos = str_pos_in_arr("path", col_name, argc);
   if (path_col_pos == -1) {
     fprintf(stderr, "path column not found at song_query_callback\n");
     return 1;
   }
   int len = strlen(argv[path_col_pos]) + 1;
-  db_entity_ptr->path = malloc(len);
-  if (db_entity_ptr->path == NULL) {
+  song->path = malloc(len);
+  if (song->path == NULL) {
     fprintf(stderr, "Out of memory at song_query_callback malloc\n");
     return 1;
   }
-  strcpy(db_entity_ptr->path, argv[path_col_pos]);
+  if (strcmp(argv[0], "29") == 0) {
+    printf("debug");
+  }
+  strcpy(song->path, argv[path_col_pos]);
   return 0;
 }
 
-static int verify_song_callback(void *controller, int argc, char **argv, char **col_name) {
+int bliss_library_callback(void *controller_ptr, int argc, char **argv, char **col_name) {
+  library_controller *controller = controller_ptr;
+  int song_id = 0;
+  if (!get_int_by_column_name("id", argc, argv, col_name, &song_id)) {
+    return 1;
+  }
+  bliss_analysis *(*library_ptr)[controller->max_song_id + 1] = controller->library;
+  bliss_analysis *analysis = (*library_ptr)[song_id];
+  analysis->song_id = song_id;
+  if (get_bliss_analysis_features(controller->bliss_db, song_id, analysis) != 0) {
+    fprintf(stderr, "get_bliss_analysis_features failed for song_id %d at bliss_library_callback\n", song_id);
+    free(analysis);
+    return 1;
+  }
+  return 0;
+}
+
+int bliss_analysis_callback(void *analysis, int argc, char **argv, char **col_name) {
   char *end_ptr;
+  bliss_analysis *analysis_ptr = analysis;
+  int feature_index_index = 0;
+  if (!get_int_by_column_name("feature_index", argc, argv, col_name, &feature_index_index)) {
+    return 1;
+  };
+  int feature_pos = str_pos_in_arr("feature", col_name, argc);
+  if (feature_pos == -1) {
+    fprintf(stderr, "feature column not found at bliss_analysis_callback\n");
+    return 1;
+  }
   errno = 0;
-  VerifySongController *controller_ptr = controller;
-  int *i = controller_ptr->i;
-  int song_id_col_pos = str_pos_in_arr("song_id", col_name, argc);
-  if (song_id_col_pos == -1) {
-    fprintf(stderr, "song_id column not found at verify_song_callback\n");
+  double feature = strtod(argv[feature_pos], &end_ptr);
+  if (errno == ERANGE || *end_ptr != '\0' || end_ptr == argv[feature_pos]) {
+    fprintf(stderr, "strtol failed at bliss_analysis_callback\n");
     return 1;
-  }
-  int mpd_db_id = strtol(argv[song_id_col_pos], &end_ptr, 10);
-  if (errno == ERANGE || *end_ptr != '\0' || end_ptr == argv[song_id_col_pos]) {
-    fprintf(stderr, "strtol failed at verify_song_callback\n");
-    return 1;
-  }
-  MPDDatabaseResponse *db_response = malloc(sizeof(MPDDatabaseResponse));
-  if (db_response == NULL) {
-    fprintf(stderr, "Out of memory at verify_song_callback db_response malloc\n");
-    return 1;
-  }
-  db_response->argc = argc;
-  db_response->argv = argv;
-  db_response->col_name = col_name;
-  if (mpd_db_id != *i) { // song(s) not in mpd_db, add it/them from bliss_db
-    return add_mpd_db_songs_from_bliss_db(controller, mpd_db_id, db_response);
-  }
-  else { // song in mpd_db, verify path matches bliss_db
-    return verify_mpd_db_song_against_bliss_db(controller, mpd_db_id, db_response);
-  }
+  } 
+  analysis_ptr->features[feature_index_index] = feature;
+  return 0;
 }
 
-void get_all_mpd_songs(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss_db) {
-  char *sql_clear_mpd_db = "DROP TABLE entities; CREATE TABLE entities(type INT, "
-                           "path text primary key, atime INT, mtime INT, "
-                           "song_id INT unique);";
-  char *z_err = 0;
-  int mpd_rc = sqlite3_exec(mpd_db, sql_clear_mpd_db, clear_callback, 0, &z_err);
-  if (mpd_rc != SQLITE_OK) {
-    fprintf(stderr, "sqlite exec error at mpd_db clear: %s\n", z_err);
-    free(z_err);
-    return;
-  }
-  printf("Getting all %d items, this will take a while...\n", mpd_total);
-  if (mpd_send_list_all(conn, "")) {
-    struct mpd_entity *entity;
-    while ((entity = mpd_recv_entity(conn))) {
-      DatabaseEntity db_entity = {
-        .atime = 0,
-        .mtime = 0,
-        .type = mpd_entity_get_type(entity),
-        .path = "",
-        .song_id = 0
-      };
-      switch (db_entity.type) {
-      case MPD_ENTITY_TYPE_DIRECTORY:
-        mpd_entity_free(entity);
-        continue;
-      case MPD_ENTITY_TYPE_PLAYLIST:
-        mpd_entity_free(entity);
-        continue;
-      case MPD_ENTITY_TYPE_SONG:
-        const struct mpd_song *song = mpd_entity_get_song(entity);
-        db_entity.path = strdup(mpd_song_get_uri(song));
-        db_entity.mtime = mpd_song_get_last_modified(song);
-        db_entity.atime = mpd_song_get_added(song);
-        break;
-      case MPD_ENTITY_TYPE_UNKNOWN:
-      default:
-        fprintf(stderr, "Unknown entity type: %d\n", db_entity.type);
-        mpd_entity_free(entity);
-        return;
-      }
-      db_entity.path = replace_all(db_entity.path, "'", "''");
-      if (db_entity.path == NULL) {
-        fprintf(stderr, "db_entity.path replace_all failed\n");
-        mpd_entity_free(entity);
-        return;
-      }
-      if (db_entity.type == MPD_ENTITY_TYPE_SONG) {
-        db_entity.song_id = get_song_id(&db_entity, bliss_db);
-        if (db_entity.song_id == 0) {
-          fprintf(stderr, "Failed to get bliss song_id for %s\n", db_entity.path);
-        }
-      }
-      if (check_for_dup(conn, &db_entity, mpd_db)) {
-        fprintf(stderr, "Duplicate found for %s\n", db_entity.path);
-        free(db_entity.path);
-        mpd_entity_free(entity);
-        continue;
-      }
-      if (!add_to_mpd_db(&db_entity, mpd_db, bliss_db)) {
-        fprintf(stderr, "add_to_mpd_db failed\n");
-        free(db_entity.path);
-        mpd_entity_free(entity);
-        return;
-      }
-      free(db_entity.path);
-      mpd_entity_free(entity);
-    }
-    printf("Success!\n");
-    if (mpd_connection_get_error(conn) != MPD_ERROR_SUCCESS) {
-      fprintf(stderr, "mpd connection error at recv_entity: %s\n", mpd_connection_get_error_message(conn));
-      return;
-    }
-  }
-  else {
-    fprintf(stderr, "mpd connection error at send_list_all: %s\n", mpd_connection_get_error_message(conn));
-    return;
-  }
-}
-
-void get_all_songs_since_timestamp(struct mpd_connection *conn, struct timespec *timestamp, sqlite3 *mpd_db, sqlite3 *bliss_db) {
-  char time_str[256];
-  strftime(time_str, sizeof(time_str), "%FT%T%z", localtime(&timestamp->tv_sec));
-  printf("Getting items added since %s, this might take a while...\n", time_str);
-  if (mpd_search_db_songs(conn, true) &&
-      mpd_search_add_added_since_constraint(conn, MPD_OPERATOR_DEFAULT, (time_t)timestamp->tv_sec) &&
-      mpd_search_commit(conn)) {
-    struct mpd_song *song;
-    while ((song = mpd_recv_song(conn))) {
-      DatabaseEntity db_entity = {
-        .atime = mpd_song_get_added(song),
-        .mtime = mpd_song_get_last_modified(song),
-        .type = MPD_ENTITY_TYPE_SONG,
-        .path = strdup(mpd_song_get_uri(song)),
-        .song_id = 0
-      };
-      db_entity.path = replace_all(db_entity.path, "'", "''");
-      if (db_entity.path == NULL) {
-        fprintf(stderr, "db_entity.path replace_all failed\n");
-        mpd_song_free(song);
-        return;
-      }
-      db_entity.song_id = get_song_id(&db_entity, bliss_db);
-      if (db_entity.song_id == 0) {
-        fprintf(stderr, "Failed to get bliss song_id for %s\n", db_entity.path);
-      }
-      if (check_for_dup(conn, &db_entity, mpd_db)) {
-        fprintf(stderr, "Duplicate found for %s\n", db_entity.path);
-        free(db_entity.path);
-        mpd_song_free(song);
-        continue;
-      }
-      if (!add_to_mpd_db(&db_entity, mpd_db, bliss_db)) {
-        fprintf(stderr, "add_to_mpd_db failed\n");
-        free(db_entity.path);
-        mpd_song_free(song);
-        return;
-      }
-      free(db_entity.path);
-      mpd_song_free(song);
-    }
-    printf("Success!\n");
-    if (mpd_connection_get_error(conn) != MPD_ERROR_SUCCESS) {
-      fprintf(stderr, "mpd connection error at recv_entity: %s\n", mpd_connection_get_error_message(conn));
-      mpd_song_free(song);
-      return;
-    }
-  }
-  else {
-    fprintf(stderr, "No new songs\n");
-    return;
-  }
-}
-
-bool check_for_dup(struct mpd_connection *conn, DatabaseEntity *db_entity, sqlite3 *mpd_db) {
-  char *z_err = 0;
-  char *check_for_dup_prefix = "select * from entities where path = ";
-  int dup_check_len = strlen(check_for_dup_prefix) + strlen(db_entity->path) + 3;
-  char *check_for_dup = malloc(dup_check_len);
-  snprintf(check_for_dup, dup_check_len, "%s'%s'", check_for_dup_prefix, db_entity->path);
-  bool dup_found;
-  int mpd_rc = sqlite3_exec(mpd_db, check_for_dup, dup_callback, &dup_found, &z_err);
-  if (mpd_rc != SQLITE_OK) {
-    fprintf(stderr, "sqlite check_for_dup exec error: %s\n", z_err);
-    free(z_err);
-    free(check_for_dup);
-    free(db_entity->path);
-    mpd_connection_free(conn);
-    exit(1);
-  }
-  free(check_for_dup);
-  return dup_found;
-}
-
-bool add_to_mpd_db(DatabaseEntity *db_entity, sqlite3 *mpd_db, sqlite3 *bliss_db) {
-  char *z_err = 0;
-  char *sql_header = "insert into entities(type, path, mtime, atime, song_id) values ";
-  int len = strlen(sql_header) + snprintf(NULL, 0, "%d", db_entity->type) + 1 +
-            strlen(db_entity->path) + 1 +
-            snprintf(NULL, 0, "%ld", db_entity->mtime) + 1 +
-            snprintf(NULL, 0, "%ld", db_entity->atime) + 1 +
-            snprintf(NULL, 0, "%d", db_entity->song_id) +
-            6; // 6 = two parens, a semicolon, two quotes, and a null
-  char *row = malloc(len);
-  if (row == NULL) {
-    fprintf(stderr, "Out of memory at malloc row\n");
-    return false;
-  }
-  snprintf(row, len, "%s(%d,'%s',%ld,%ld,%d);", sql_header, db_entity->type, db_entity->path, db_entity->mtime, db_entity->atime, db_entity->song_id);
-#ifdef DEBUG
-  printf("%s\n", row);
-#endif
-  int mpd_rc = sqlite3_exec(mpd_db, row, clear_callback, 0, &z_err);
-  if (mpd_rc != SQLITE_OK) {
-    fprintf(stderr, "sqlite exec error for %s (song_id: %d) at add_to_mpd_db: %s\n", db_entity->path, db_entity->song_id, z_err);
-    free(z_err);
-    free(row);
-    return false;
-  }
-  free(row);
-  return true;
-}
-
-int get_song_id(DatabaseEntity *db_entity, sqlite3 *bliss_db) {
+int get_song_id(db_song *song, sqlite3 *bliss_db, char *mpd_music_dir) {
   char *z_err = 0;
   char *sql_header = "select * from song where path = ";
-  int len = strlen(sql_header) + strlen(MPD_MUSIC_DIR) +
-            strlen(db_entity->path) +
+  int len = strlen(sql_header) + strlen(mpd_music_dir) +
+            strlen(song->path) +
             4; // 4 = two quotes, semicolon, and a null
   char *sql_query = malloc(len);
   if (sql_query == NULL) {
     fprintf(stderr, "Out of memory at get_song_id malloc");
   }
-  snprintf(sql_query, len, "%s'%s%s';", sql_header, MPD_MUSIC_DIR, db_entity->path);
+  snprintf(sql_query, len, "%s'%s%s';", sql_header, mpd_music_dir, song->path);
   int song_id = 0;
   int bliss_rc = sqlite3_exec(bliss_db, sql_query, song_id_callback, &song_id, &z_err);
   if (bliss_rc != SQLITE_OK) {
@@ -433,48 +292,78 @@ int get_song_id(DatabaseEntity *db_entity, sqlite3 *bliss_db) {
   return song_id;
 }
 
-int random_playlist(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss_db, size_t playlist_len) {
+char *query_builder(char *header, int variable, int footer) {
+  int len = strlen(header) + snprintf(NULL, 0, "%d", variable) + footer;
+  char *query = malloc(len);
+  if (query == NULL) {
+    fprintf(stderr, "Out of memory at query_builder\n");
+    exit(1);
+  }
+  snprintf(query, len, "%s%d;", header, variable);
+  return query;
+}
+
+void db_songs_free(size_t len, db_song *songs[len], size_t start) {
+  for (int i = start; i < len; i++) {
+    if (songs[i] != NULL && songs[i]->path != NULL) {
+      free(songs[i]->path);
+      free(songs[i]);
+    }
+  }
+}
+
+int random_query_callback(void *controller_ptr, int argc, char **argv, char **col_name) {
+  random_query_controller *controller = controller_ptr;
+  db_song *song = malloc(sizeof(db_song));
+  if (song == NULL) {
+    fprintf(stderr, "Out of memory at random_query_callback song malloc\n");
+    return 1;
+  }
+  int song_id = 0;
+  if (!get_int_by_column_name("id", argc, argv, col_name, &song_id)) {
+    free(song);
+    return 1;
+  }
+  song->song_id = song_id;
+  int path_col_pos = str_pos_in_arr("path", col_name, argc);
+  if (path_col_pos == -1) {
+    fprintf(stderr, "path column not found at random_query_callback\n");
+    free(song);
+    return 1;
+  }
+  song->path = malloc(strlen(argv[path_col_pos]) - strlen(controller->music_dir) + 1);
+  if (song->path == NULL) {
+    fprintf(stderr, "Out of memory at random_query_callback song->path malloc\n");
+    free(song);
+    return 1;
+  }
+  if (strstr(argv[path_col_pos], controller->music_dir) == argv[path_col_pos]) {
+    strcpy(song->path, argv[path_col_pos] + strlen(controller->music_dir));
+  }
+  else {
+    fprintf(stderr, "Failed to remove music_dir prefix at random_query_callback\n");
+    return 1;
+  }
+  controller->songs[controller->i] = song;
+  controller->i++;
+  return 0;
+}
+
+int random_playlist(struct mpd_connection *conn, sqlite3 *bliss_db, size_t playlist_len, char *music_dir) {
   char *z_err = 0;
   srand((unsigned) time(NULL));
-  DatabaseEntity *db_entities[playlist_len];
   printf("Creating random playlist of length %jd...\n", playlist_len);
-  int used_song_ids[playlist_len];
-  memset(used_song_ids, 0, playlist_len * sizeof(int));
-  for (int i = 0; i < playlist_len; i++) {
-    int rand_song_id = rand() % mpd_songs_total + 1;
-    while (int_in_arr(rand_song_id, used_song_ids, playlist_len)) {
-      rand_song_id = rand() % mpd_songs_total + 1;
-    }
-    used_song_ids[i] = rand_song_id;
-    DatabaseEntity *db_entity = malloc(sizeof(DatabaseEntity));
-    db_entity->type = MPD_ENTITY_TYPE_SONG;
-    db_entity->atime = 0;
-    db_entity->mtime = 0;
-    db_entity->song_id = rand_song_id;
-    char *song_query_header = "select * from entities where song_id = ";
-    int len = strlen(song_query_header) + snprintf(NULL, 0, "%d", db_entity->song_id) + 2;
-    char *song_query = malloc(len);
-    if (song_query == NULL) {
-      fprintf(stderr, "Out of memory at random_playlist malloc\n");
-      return 1;
-    }
-    snprintf(song_query, len, "%s%d;", song_query_header, db_entity->song_id);
-    int mpd_rc = sqlite3_exec(mpd_db, song_query, song_query_callback, db_entity, &z_err);
-    if (mpd_rc != SQLITE_OK) {
-      fprintf(stderr, "sqlite exec error at random_playlist: %s\n", z_err);
-      free(z_err);
-      free(song_query);
-      return 1;
-    }
-    if (db_entity->path == NULL) {
-      fprintf(stderr, "Failed to add song with song_id %d at random_playlist\n", rand_song_id);
-      free(song_query);
-      free(db_entity);
-      return 1;
-    }
-    db_entities[i] = db_entity;
-    free(song_query);
+  db_song *songs[playlist_len];
+  random_query_controller controller = {.i = 0, .music_dir = music_dir, .songs = songs};
+  char *random_query = query_builder("select * from song order by random() limit ", playlist_len, 2);
+  int bliss_rc = sqlite3_exec(bliss_db, random_query, random_query_callback, &controller, &z_err);
+  if (bliss_rc != SQLITE_OK) {
+    fprintf(stderr, "sqlite exec error at random_playlist: %s\n", z_err);
+    free(random_query);
+    free(z_err);
+    return 1;
   }
+  free(random_query);
 
   const char *random_playlist_name = "random";
   bool rm_rc = mpd_run_rm(conn, random_playlist_name);
@@ -484,276 +373,173 @@ int random_playlist(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss
       enum mpd_server_error server_err = mpd_connection_get_server_error(conn);
       if (server_err != MPD_SERVER_ERROR_NO_EXIST) {
         fprintf(stderr, "mpd_run_rm server error code: %d", server_err);
-        db_entities_free(db_entities, playlist_len);
+        db_songs_free(playlist_len, songs, 0);
         return 1;
       }
     }
     else {
       printf("mpd_run_rm error: %d\n", mpd_connection_get_error(conn));
-      db_entities_free(db_entities, playlist_len);
+      db_songs_free(playlist_len, songs, 0);
       return 1;
     }
   }
   for (int i = 0; i < playlist_len; i++) {
-    bool playlist_add_rc = mpd_send_playlist_add(conn, random_playlist_name, db_entities[i]->path);
+    bool playlist_add_rc = mpd_run_playlist_add(conn, random_playlist_name, songs[i]->path);
     if (!playlist_add_rc) {
       enum mpd_error err = mpd_connection_get_error(conn);
       if (err == MPD_ERROR_SERVER) {
-        fprintf(stderr, "mpd_send_playlist_add server error code: %d\n", mpd_connection_get_server_error(conn));
-        db_entities_free(db_entities, playlist_len);
+        fprintf(stderr, "mpd_run_playlist_add server error code: %d\n", mpd_connection_get_server_error(conn));
+        db_songs_free(playlist_len, songs, i);
         return 1;
       }
-      fprintf(stderr, "mpd_send_playlist_add error: %d\n", mpd_connection_get_error(conn));
-      db_entities_free(db_entities, playlist_len);
+      fprintf(stderr, "mpd_run_playlist_add error: %d\n", mpd_connection_get_error(conn));
+      db_songs_free(playlist_len, songs, i);
       return 1;
     }
-    bool res_rc = mpd_response_finish(conn);
-    if (!res_rc) {
-      enum mpd_error err = mpd_connection_get_error(conn);
-      if (err == MPD_ERROR_SERVER) {
-        fprintf(stderr, "mpd_response_finish server error code: %d\n", mpd_connection_get_server_error(conn));
-        db_entities_free(db_entities, playlist_len);
-        return 1;
-      }
-      fprintf(stderr, "mpd_response_finish error at random_playlist: %d", mpd_connection_get_error(conn));
-      db_entities_free(db_entities, playlist_len);
-      return 1;
-    }
-    free(db_entities[i]->path);
-    free(db_entities[i]);
+    free(songs[i]->path);
+    free(songs[i]);
   }
   return 0;
 }
 
-void db_entities_free(DatabaseEntity **db_entities, size_t len) {
-  for (int i = 0; i < len; i++) {
-    free(db_entities[i]->path);
-    free(db_entities[i]);
-  }
-}
-
-int add_mpd_db_songs_from_bliss_db(VerifySongController *controller, int mpd_db_id, MPDDatabaseResponse *db_response) {
-  int *i = controller->i;
+int get_bliss_analysis_features(sqlite3* bliss_db, int song_id, bliss_analysis *analysis) {
   char *z_err = 0;
-  int diff = mpd_db_id - *i;
-  while (diff--) {
-    char *missing_song_query_header = "select * from song where id = ";
-    int len = strlen(missing_song_query_header) + snprintf(NULL, 0, "%d", *i) + 2;
-    char *missing_song_query = malloc(len);
-    if (missing_song_query == NULL) {
-      fprintf(stderr, "Out of memory at verify_song_callback missing_song_query malloc\n");
-      free(db_response);
-      return 1;
-    }
-    snprintf(missing_song_query, len, "%s%d;", missing_song_query_header, *i);
-    DatabaseEntity *db_entity = malloc(sizeof(DatabaseEntity));
-    if (db_entity == NULL) {
-      fprintf(stderr, "Out of memory at verify_song_callback missing branch db_entity malloc\n");
-      free(db_response);
-      return 1;
-    }
-    db_entity->type = MPD_ENTITY_TYPE_SONG;
-    db_entity->song_id = *i;
-    db_entity->path = NULL;
-    int bliss_rc = sqlite3_exec(controller->bliss_db, missing_song_query, song_query_callback, db_entity, &z_err);
-    if (bliss_rc != SQLITE_OK) {
-      fprintf(stderr, "sqlite exec error at verify_song_callback: %s\n", z_err);
-      free(z_err);
-      free(missing_song_query);
-      free(db_entity);
-      free(db_response);
-      return 1;
-    }
-    if (db_entity->path == NULL) {
-      fprintf(stderr, "Failed to find matching song_id for %d, you may need to run `blissify rescan`; continuing...\n", *i);
-      free(missing_song_query);
-      free(db_entity);
-      (*i)++;
-      continue;
-    }
-    if (mpd_search_db_songs(controller->conn, true) &&
-        mpd_search_add_uri_constraint(controller->conn, MPD_OPERATOR_DEFAULT, db_entity->path) &&
-        mpd_search_commit(controller->conn)) {
-      struct mpd_song *song;
-      while ((song = mpd_recv_song(controller->conn))) {
-        db_entity->atime = mpd_song_get_added(song);
-        db_entity->mtime = mpd_song_get_last_modified(song);
-        mpd_song_free(song);
-      }
-    }
-    char* bliss_path_prefix = strstr(db_entity->path, MPD_MUSIC_DIR);
-    if (bliss_path_prefix == NULL) {
-      fprintf(stderr, "Could not remove prefix from bliss path for %s\n", db_entity->path);
-      free(missing_song_query);
-      free(db_entity->path);
-      free(db_entity);
-      free(db_response);
-      return 1;
-    }
-    if (MPD_MUSIC_DIR[0] != '\0' && bliss_path_prefix == db_entity->path) { // prefix found
-      memmove(db_entity->path, db_entity->path + strlen(MPD_MUSIC_DIR), strlen(db_entity->path + strlen(MPD_MUSIC_DIR)) + 1);
-    } 
-    db_entity->path = replace_all(db_entity->path, "'", "''");
-    if (!add_to_mpd_db(db_entity, controller->mpd_db, controller->bliss_db)) {
-      fprintf(stderr, "Failed to add song %s to mpd_db at verify_song_callback\n", db_entity->path);
-      free(missing_song_query);
-      free(db_entity->path);
-      free(db_entity);
-      free(db_response);
-      return 1;
-    }
-    else {
-      printf("Added song %s to mpd_db from bliss_db\n", db_entity->path);
-    }
-    free(missing_song_query);
-    free(db_entity->path);
-    free(db_entity);
-    (*i)++;
-  }
-  return verify_mpd_db_song_against_bliss_db(controller, mpd_db_id, db_response);
-}
-
-int verify_mpd_db_song_against_bliss_db(VerifySongController *controller, int mpd_db_id, MPDDatabaseResponse *db_response) {
-  char *z_err = 0;
-  char *existing_song_query_header = "select * from song where id = ";
-  int len = strlen(existing_song_query_header) + snprintf(NULL, 0, "%d", mpd_db_id) + 2;
-  char *existing_song_query = malloc(len);
-  if (existing_song_query == NULL) {
-    fprintf(stderr, "Out of memory at verify_song_callback existing_song_query malloc\n");
-    free(db_response);
-    return 1;
-  }
-  snprintf(existing_song_query, len, "%s%d;", existing_song_query_header, mpd_db_id);
-  DatabaseEntity *db_entity = malloc(sizeof(DatabaseEntity));
-  if (db_entity == NULL) {
-    fprintf(stderr, "Out of memory at verify_song_callback existing branch db_entity malloc\n");
-    free(db_response);
-    return 1;
-  }
-  db_entity->type = MPD_ENTITY_TYPE_SONG;
-  db_entity->song_id = mpd_db_id;
-  db_entity->path = NULL;
-  int bliss_rc = sqlite3_exec(controller->bliss_db, existing_song_query, song_query_callback, db_entity, &z_err);
+  char *bliss_analysis_query = query_builder("select * from feature where song_id = ", song_id, 2);
+  int bliss_rc = sqlite3_exec(bliss_db, bliss_analysis_query, bliss_analysis_callback, analysis, &z_err);
   if (bliss_rc != SQLITE_OK) {
-    fprintf(stderr, "sqlite exec error at verify_song_callback: %s\n", z_err);
+    fprintf(stderr, "sqlite exec error at get_bliss_analysis_features: %s\n", z_err);
     free(z_err);
-    free(existing_song_query);
-    free(db_entity);
-    free(db_response);
+    free(bliss_analysis_query);
     return 1;
   }
-  if (db_entity->path == NULL) {
-    fprintf(stderr, "Failed to find matching song_id for %d, you may need to run `blissify rescan`; continuing...\n", mpd_db_id);
-    free(existing_song_query);
-    free(db_entity);
-    free(db_response);
-    return 0;
-  }
-  char* bliss_path_prefix = strstr(db_entity->path, MPD_MUSIC_DIR);
-  if (bliss_path_prefix == NULL) {
-    fprintf(stderr, "Could not remove prefix from bliss path for %s\n", db_entity->path);
-    free(existing_song_query);
-    free(db_entity->path);
-    free(db_entity);
-    free(db_response);
-    return 1;
-  }
-  if (MPD_MUSIC_DIR[0] != '\0' && bliss_path_prefix == db_entity->path) { // prefix found
-    memmove(db_entity->path, db_entity->path + strlen(MPD_MUSIC_DIR), strlen(db_entity->path + strlen(MPD_MUSIC_DIR)) + 1);
-  }
-  int path_col_pos = str_pos_in_arr("path", db_response->col_name, db_response->argc);
-  if (path_col_pos == -1) {
-    fprintf(stderr, "path column not found at verify_song_callback\n");
-    free(existing_song_query);
-    free(db_entity->path);
-    free(db_entity);
-    free(db_response);
-    return 1;
-  }
-  if (strcmp(db_entity->path, db_response->argv[path_col_pos]) != 0) {
-    fprintf(stderr, "mpd_db and bliss_db don't match for song_id %d, mpd_db path %s, bliss_db path %s\n", mpd_db_id, db_response->argv[path_col_pos], db_entity->path);
-    free(existing_song_query);
-    free(db_entity->path);
-    free(db_entity);
-    free(db_response);
-    return 1;
-  }
-  (*controller->i)++;
-  free(existing_song_query);
-  free(db_entity->path);
-  free(db_entity);
-  free(db_response);
+  free(bliss_analysis_query);
   return 0;
 }
 
-int verify_mpd_db(struct mpd_connection *conn, sqlite3 *mpd_db, sqlite3 *bliss_db) {
+int get_bliss_library(sqlite3* bliss_db, int max_song_id, bliss_analysis *(*library)[max_song_id + 1]) {
   char *z_err = 0;
-  char *all_songs_query = "select * from entities order by song_id;";
-  printf("Verifying mpd.db...\n");
-  VerifySongController controller = {
-    .i = malloc(sizeof(int)),
-    .conn = conn,
+  library_controller library_controller = {
+    .library = library,
     .bliss_db = bliss_db,
-    .mpd_db = mpd_db
+    .max_song_id = max_song_id
   };
-  if (controller.i == NULL) {
-    fprintf(stderr, "Out of memory at verify_mpd_db malloc\n");
-    return 1;
-  }
-  *controller.i = 1;
-  int mpd_rc = sqlite3_exec(mpd_db, all_songs_query, verify_song_callback, &controller, &z_err);
-  if (mpd_rc != SQLITE_OK) {
-    fprintf(stderr, "sqlite exec error at verify_mpd_db: %s\n", z_err);
+  char *bliss_library_query = "select * from song;";
+  int bliss_rc = sqlite3_exec(bliss_db, bliss_library_query, bliss_library_callback, &library_controller, &z_err);
+  if (bliss_rc != SQLITE_OK) {
+    fprintf(stderr, "sqlite exec error at get_bliss_library: %s\n", z_err);
     free(z_err);
     return 1;
   }
-  printf("mpd_db verified!\n");
-  free(controller.i);
   return 0;
+}
+
+int max_song_id_callback(void *max_song_id, int argc, char **argv, char **col_name) {
+  int *max_song_id_ptr = max_song_id;
+  if (!get_int_by_column_name("max(id)", argc, argv, col_name, max_song_id_ptr)) {
+    return 1;
+  };
+  return 0;
+}
+
+bool get_max_song_id(sqlite3 *bliss_db, int *max_song_id) {
+  char *z_err;
+  char *max_song_id_query = "select max(id) from song;";
+  int bliss_rc = sqlite3_exec(bliss_db, max_song_id_query, max_song_id_callback, max_song_id, &z_err);
+  if (bliss_rc != SQLITE_OK) {
+    fprintf(stderr, "sqlite exec error at get_max_song_id: %s\n", z_err);
+    free(z_err);
+    return false;
+  }
+  return true;
 }
 
 int main(int argc, char **argv) {
-  sqlite3 *mpd_db;
   sqlite3 *bliss_db;
-  FILE *timestamp_fp;
-  bool empty_timestamp = true;
   struct mpd_connection *conn = mpd_connection_new(NULL, 0, 300000);
   if (conn == NULL) {
     fprintf(stderr, "Out of memory at mpd_connection_new\n");
     return 1;
   }
   mpd_connection_set_keepalive(conn, true);
-  if (argv[1]) {
-    if (!mpd_run_password(conn, argv[1])) {
+
+  char *password = NULL;
+  char *bliss_db_path = NULL;
+  char *base_song_id = NULL;
+  char *music_dir = NULL;
+
+  while (1) {
+    struct option long_opts[] = {
+      { "password", required_argument, 0, 'p' },
+      { "bliss-db", required_argument, 0, 'b' },
+      { "song-id", required_argument, 0, 's' },
+      { "music-dir", required_argument, 0, 'm' },
+      { 0, 0, 0, 0 }
+    };
+    int opt_index = 0;
+    int c = getopt_long(argc, argv, "p:b:s:m:", long_opts, &opt_index);
+    if (c == -1) {
+      break;
+    }
+    switch (c) {
+      case 0:
+        fprintf(stderr, "Unknown getopt_long option %c\n", c);
+        break;
+      case 'p':
+        password = optarg;
+        break;
+      case 'b':
+        bliss_db_path = optarg;
+        break;
+      case 's':
+        base_song_id = optarg;
+        break;
+      case 'm':
+        music_dir = optarg;
+        break;
+      case '?':
+        break;
+      default:
+        fprintf(stderr, "Unknown getopt_long error\n");
+        return 1;
+    }
+  }
+
+  if (optind < argc) {
+    fprintf(stderr, "Extra unrecognized arguments: ");
+    while (optind < argc) {
+      fprintf(stderr, "%s ", argv[optind++]);
+    }
+    putchar('\n');
+  }
+
+  if (password) {
+    if (!mpd_run_password(conn, password)) {
       fprintf(stderr, "Bad password\n");
       mpd_connection_free(conn);
       return 1;
     }
   }
-  int mpd_rc = sqlite3_open("mpd.db", &mpd_db);
-  if (mpd_rc) {
-    fprintf(stderr, "sqlite error at open mpd_db: %s\n", sqlite3_errmsg(mpd_db));
+
+  if (bliss_db_path == NULL) {
+    fprintf(stderr, "No bliss sqlite db location specified, use option --bliss-db\n");
     return 1;
   }
-  // TODO: check if mpd.db empty and create table entities if so
-  int bliss_rc = sqlite3_open("/home/aririos/.config/bliss-rs/songs.db", &bliss_db);
-  if (bliss_rc) {
+
+  if (music_dir == NULL) {
+    fprintf(stderr, "No music directory specified, use option --music-dir\n");
+    return 1;
+  }
+
+  int bliss_rc = sqlite3_open(bliss_db_path, &bliss_db);
+  if (bliss_rc != SQLITE_OK) {
     fprintf(stderr, "sqlite error at open bliss_db: %s\n", sqlite3_errmsg(bliss_db));
     mpd_connection_free(conn);
-    int db_close_status = sqlite3_close(mpd_db);
-    if (db_close_status != SQLITE_OK) {
-      fprintf(stderr, "Failed to close mpd_db with error code %d\n", db_close_status);
-    }
     return 1;
   }
 
   if (mpd_connection_get_error(conn) != MPD_ERROR_SUCCESS) {
     fprintf(stderr, "mpd connection error at init: %s\n", mpd_connection_get_error_message(conn));
     mpd_connection_free(conn);
-    int mpd_db_close_status = sqlite3_close(mpd_db);
-    if (mpd_db_close_status != SQLITE_OK) {
-      fprintf(stderr, "Failed to close mpd_db with error code %d\n", mpd_db_close_status);
-    }
     int bliss_db_close_status = sqlite3_close(bliss_db);
     if (bliss_db_close_status != SQLITE_OK) {
       fprintf(stderr, "Failed to close bliss_db with error code %d\n", bliss_db_close_status);
@@ -761,34 +547,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  timestamp_fp = fopen("timestamp", "r+");
-  if (timestamp_fp == NULL) {
-    timestamp_fp = fopen("timestamp", "w");
-    if (timestamp_fp == NULL) {
-      fprintf(stderr, "Failed to create timestamp file\n");
-      return 1;
-    }
-    fclose(timestamp_fp);
-    timestamp_fp = fopen("timestamp", "r+");
-  }
-  struct timespec last_ts = { .tv_nsec = 0, .tv_sec = 0 };
-  fscanf(timestamp_fp, "%jd", &last_ts.tv_sec);
-  if (last_ts.tv_sec != 0) {
-    empty_timestamp = false;
-  }
-  struct timespec cur_ts;
-  timespec_get(&cur_ts, TIME_UTC);
-  fseek(timestamp_fp, 0, SEEK_SET);
-  fprintf(timestamp_fp, "%jd", (intmax_t)cur_ts.tv_sec);
-  fclose(timestamp_fp);
-
-#ifdef DEBUG
-  empty_timestamp = true;
-#endif
-
   char blissify_cmd[256];
-  if (argv[1]) {
-    snprintf(blissify_cmd, 255, "MPD_HOST='%s@127.0.0.1' MPD_PORT=6600 blissify update", argv[1]); // TODO: get host and port programmatically
+  if (password) {
+    snprintf(blissify_cmd, 255, "MPD_HOST='%s@127.0.0.1' MPD_PORT=6600 blissify update", password); // TODO: get host and port programmatically
   }
   else {
     snprintf(blissify_cmd, 255, "MPD_PORT=6600 blissify update"); // TODO: get host and port programmatically
@@ -801,35 +562,52 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  printf("Getting stats...\n");
-  struct mpd_stats *stats = mpd_run_stats(conn);
-  if (stats == NULL) {
-    fprintf(stderr, "Out of memory at mpd_run_stats\n");
-    return 1;
-  }
-  mpd_total = mpd_stats_get_number_of_artists(stats) +
-              mpd_stats_get_number_of_albums(stats) +
-              mpd_stats_get_number_of_songs(stats);
-  mpd_songs_total = mpd_stats_get_number_of_songs(stats);
-  mpd_stats_free(stats);
-
-  if (empty_timestamp) {
-    get_all_mpd_songs(conn, mpd_db, bliss_db);
+  if (base_song_id == NULL) {
+    random_playlist(conn, bliss_db, 50, music_dir);
   }
   else {
-    get_all_songs_since_timestamp(conn, &last_ts, mpd_db, bliss_db);
+    int *base_song_id_int = malloc(sizeof(int));
+    if (base_song_id_int == NULL) {
+      fprintf(stderr, "Out of memory at base_song_id_int malloc\n");
+      return 1;
+    } 
+    strtol_err_wrap(base_song_id, base_song_id_int);
+    printf("Making playlist from song_id %d\n", *base_song_id_int);
+    int max_song_id = 0;
+    if (!get_max_song_id(bliss_db, &max_song_id)) {
+      fprintf(stderr, "Failed to get max song_id\n");
+      return 1;
+    }
+    bliss_analysis *(*library)[max_song_id+1] = malloc(sizeof(bliss_analysis*[max_song_id+1]));
+    if (library == NULL) {
+      fprintf(stderr, "Out of memory at library malloc\n");
+      return 1;
+    }
+    for (int i = 0; i <= max_song_id; i++) {
+      bliss_analysis *analysis = calloc(1, sizeof(bliss_analysis));
+      if (analysis == NULL) {
+        fprintf(stderr, "Out of memory at analysis malloc for i %d", i);
+        return 1;
+      }
+      (*library)[i] = analysis;
+    }
+    get_bliss_library(bliss_db, max_song_id, library);
+    bliss_analysis *base_song_analysis = malloc(sizeof(bliss_analysis));
+    base_song_analysis->song_id = *base_song_id_int;
+    get_bliss_analysis_features(bliss_db, *base_song_id_int, base_song_analysis);
+    callback_t sort_callback = alloc_callback(euclidean_distance_callback, base_song_analysis);
+    qsort(*library, max_song_id + 1, sizeof(bliss_analysis*), (__compar_fn_t) sort_callback);
+    for (int i = 0; i <= max_song_id; i++) {
+      if ((*library)[i] != NULL) {
+        printf("song_id %d\n", (*library)[i]->song_id);
+        free((*library)[i]);
+      }
+    }
+    free(library);
   }
-
-  verify_mpd_db(conn, mpd_db, bliss_db);
-
-  random_playlist(conn, mpd_db, bliss_db, 50);
 
   printf("Closing...\n");
   mpd_connection_free(conn);
-  int mpd_db_close_status = sqlite3_close(mpd_db);
-  if (mpd_db_close_status != SQLITE_OK) {
-    fprintf(stderr, "Failed to close mpd_db with error code %d\n", mpd_db_close_status);
-  }
   int bliss_db_close_status = sqlite3_close(bliss_db);
   if (bliss_db_close_status != SQLITE_OK) {
     fprintf(stderr, "Failed to close bliss_db with error code %d\n", bliss_db_close_status);
