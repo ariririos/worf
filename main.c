@@ -59,6 +59,11 @@ typedef struct {
   db_song **songs;
 } random_query_controller;
 
+typedef struct {
+  char *music_dir;
+  db_song *song;
+} song_query_controller;
+
 bool int_in_arr(int needle, int *haystack, size_t len);
 int str_pos_in_arr(char *needle, char **haystack, size_t len);
 char *replace_all(char *str, const char *substr, const char *replacement);
@@ -67,13 +72,13 @@ void euclidean_distance_callback(void *center, va_alist alist);
 bool strtol_err_wrap(char *str, int *output);
 bool get_int_by_column_name(char *col_name, int argc, char **argv, char **col_names, int *val);
 int song_id_callback(void *song_id, int argc, char **argv, char **col_name);
-int song_query_callback(void *song_ptr, int argc, char **argv, char **col_name);
-int verify_song_callback(void *controller, int argc, char **argv, char **col_name);
+int song_query_callback(void *controller_ptr, int argc, char **argv, char **col_name);
 int bliss_library_callback(void *library, int argc, char **argv, char **col_name);
 int bliss_analysis_callback(void *analysis, int argc, char **argv, char **col_name);
 int get_song_id(db_song *db_song, sqlite3 *bliss_db, char *mpd_music_dir);
 int random_playlist(struct mpd_connection *conn, sqlite3 *bliss_db, size_t playlist_len, char *music_dir);
 void db_songs_free(size_t len, db_song *db_songs[len], size_t start);
+void library_songs_free(size_t len, bliss_analysis *(*library)[len], size_t start);
 int get_bliss_analysis_features(sqlite3* bliss_db, int song_id, bliss_analysis *analysis);
 int get_bliss_library(sqlite3* bliss_db, int max_song_id, bliss_analysis *(*library)[max_song_id + 1]);
 
@@ -210,8 +215,9 @@ int song_id_callback(void *song_id, int argc, char **argv, char **col_name) {
   return !get_int_by_column_name("id", argc, argv, col_name, song_id_ptr);
 }
 
-int song_query_callback(void *song_ptr, int argc, char **argv, char **col_name) {
-  db_song *song = song_ptr;
+int song_query_callback(void *controller_ptr, int argc, char **argv, char **col_name) {
+  song_query_controller *controller = controller_ptr;
+  db_song *song = controller->song;
   int path_col_pos = str_pos_in_arr("path", col_name, argc);
   if (path_col_pos == -1) {
     fprintf(stderr, "path column not found at song_query_callback\n");
@@ -223,10 +229,13 @@ int song_query_callback(void *song_ptr, int argc, char **argv, char **col_name) 
     fprintf(stderr, "Out of memory at song_query_callback malloc\n");
     return 1;
   }
-  if (strcmp(argv[0], "29") == 0) {
-    printf("debug");
+  if (strstr(argv[path_col_pos], controller->music_dir) == argv[path_col_pos]) {
+    strcpy(song->path, argv[path_col_pos] + strlen(controller->music_dir));
   }
-  strcpy(song->path, argv[path_col_pos]);
+  else {
+    fprintf(stderr, "Failed to remove music_dir prefix at song_query_callback\n");
+    return 1;
+  }
   return 0;
 }
 
@@ -304,10 +313,26 @@ char *query_builder(char *header, int variable, int footer) {
 }
 
 void db_songs_free(size_t len, db_song *songs[len], size_t start) {
+  if (start > len) {
+    fprintf(stderr, "starting position after array end at db_songs_free\n");
+    exit(1);
+  }
   for (int i = start; i < len; i++) {
     if (songs[i] != NULL && songs[i]->path != NULL) {
       free(songs[i]->path);
       free(songs[i]);
+    }
+  }
+}
+
+void library_songs_free(size_t len, bliss_analysis *(*library)[len], size_t start) {
+  if (start > len) {
+    fprintf(stderr, "starting position after array end at db_songs_free\n");
+    exit(1);
+  }
+  for (int i = start; i < len; i++) {
+    if ((*library)[i] != NULL) {
+      free((*library)[i]);
     }
   }
 }
@@ -466,6 +491,9 @@ int main(int argc, char **argv) {
   char *bliss_db_path = NULL;
   char *base_song_id = NULL;
   char *music_dir = NULL;
+  char *len_string = NULL;
+  char *blissify_update_string = NULL;
+  bool run_blissify_update = true;
 
   while (1) {
     struct option long_opts[] = {
@@ -473,10 +501,12 @@ int main(int argc, char **argv) {
       { "bliss-db", required_argument, 0, 'b' },
       { "song-id", required_argument, 0, 's' },
       { "music-dir", required_argument, 0, 'm' },
+      { "run-blissify-update", required_argument, 0, 'r' },
+      { "length", required_argument, 0, 'l'},
       { 0, 0, 0, 0 }
     };
     int opt_index = 0;
-    int c = getopt_long(argc, argv, "p:b:s:m:", long_opts, &opt_index);
+    int c = getopt_long(argc, argv, "p:b:s:m:r:", long_opts, &opt_index);
     if (c == -1) {
       break;
     }
@@ -495,6 +525,12 @@ int main(int argc, char **argv) {
         break;
       case 'm':
         music_dir = optarg;
+        break;
+      case 'r':
+        blissify_update_string = optarg;
+        break;
+      case 'l':
+        len_string = optarg;
         break;
       case '?':
         break;
@@ -530,6 +566,18 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (blissify_update_string != NULL) {
+    if (strcmp(blissify_update_string, "true") == 0) {
+      run_blissify_update = true;
+    }
+    else if (strcmp(blissify_update_string, "false") == 0) {
+      run_blissify_update = false;
+    }
+    else {
+      fprintf(stderr, "Argument %s to option --run-blissify-update not one of [true, false]\n", blissify_update_string);
+      return 1;
+    }
+  }
   int bliss_rc = sqlite3_open(bliss_db_path, &bliss_db);
   if (bliss_rc != SQLITE_OK) {
     fprintf(stderr, "sqlite error at open bliss_db: %s\n", sqlite3_errmsg(bliss_db));
@@ -547,19 +595,21 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  char blissify_cmd[256];
-  if (password) {
-    snprintf(blissify_cmd, 255, "MPD_HOST='%s@127.0.0.1' MPD_PORT=6600 blissify update", password); // TODO: get host and port programmatically
-  }
-  else {
-    snprintf(blissify_cmd, 255, "MPD_PORT=6600 blissify update"); // TODO: get host and port programmatically
-  }
-  printf("Running `blissify update`...\n");
-  int blissify_rc = system(blissify_cmd);
-  if (blissify_rc != 0) {
-    fprintf(stderr, "`blissify update` failed with exit code %d", blissify_rc);
-    mpd_connection_free(conn);
-    return 1;
+  if (run_blissify_update) {
+    char blissify_cmd[256];
+    if (password) {
+      snprintf(blissify_cmd, 255, "MPD_HOST='%s@127.0.0.1' MPD_PORT=6600 blissify update", password); // TODO: get host and port programmatically
+    }
+    else {
+      snprintf(blissify_cmd, 255, "MPD_PORT=6600 blissify update"); // TODO: get host and port programmatically
+    }
+    printf("Running `blissify update`...\n");
+    int blissify_rc = system(blissify_cmd);
+    if (blissify_rc != 0) {
+      fprintf(stderr, "`blissify update` failed with exit code %d", blissify_rc);
+      mpd_connection_free(conn);
+      return 1;
+    }
   }
 
   if (base_song_id == NULL) {
@@ -597,12 +647,63 @@ int main(int argc, char **argv) {
     get_bliss_analysis_features(bliss_db, *base_song_id_int, base_song_analysis);
     callback_t sort_callback = alloc_callback(euclidean_distance_callback, base_song_analysis);
     qsort(*library, max_song_id + 1, sizeof(bliss_analysis*), (__compar_fn_t) sort_callback);
-    for (int i = 0; i <= max_song_id; i++) {
-      if ((*library)[i] != NULL) {
-        printf("song_id %d\n", (*library)[i]->song_id);
-        free((*library)[i]);
+    int playlist_len = 50;
+    if (len_string == NULL) {
+      printf("No playlist length provided, defaulting to 50...\n");
+    }
+    else {
+      if (!strtol_err_wrap(len_string, &playlist_len)) {
+        fprintf(stderr, "Failed to convert string %s to playlist length\n", len_string);
+        return 1;
       }
     }
+    const char *generated_playlist_name = "bliss-playlist";
+    bool rm_rc = mpd_run_rm(conn, generated_playlist_name);
+    if (!rm_rc) {
+      enum mpd_error err = mpd_connection_get_error(conn);
+      if (err == MPD_ERROR_SERVER) {
+        enum mpd_server_error server_err = mpd_connection_get_server_error(conn);
+        if (server_err != MPD_SERVER_ERROR_NO_EXIST) {
+          fprintf(stderr, "mpd_run_rm server error code: %d", server_err);
+          library_songs_free(max_song_id, library, 0);
+          return 1;
+        }
+      }
+      else {
+        printf("mpd_run_rm error: %d\n", mpd_connection_get_error(conn));
+        library_songs_free(max_song_id, library, 0);
+        return 1;
+      }
+    }
+    char *z_err = 0;
+    for (int i = 0; i < playlist_len; i++) {
+      char *song_query = query_builder("select * from song where id = ", (*library)[i]->song_id, 2);
+      db_song song = { .song_id = (*library)[i]->song_id };
+      song_query_controller controller = {
+        .music_dir = music_dir,
+        .song = &song
+      };
+      int bliss_rc = sqlite3_exec(bliss_db, song_query, song_query_callback, &controller, &z_err);
+      if (bliss_rc != SQLITE_OK) {
+        fprintf(stderr, "sqlite exec error at main: %s\n", z_err);
+        free(z_err);
+        library_songs_free(max_song_id, library, 0);
+        return 1;
+      }
+      bool playlist_add_rc = mpd_run_playlist_add(conn, generated_playlist_name, song.path);
+      if (!playlist_add_rc) {
+        enum mpd_error err = mpd_connection_get_error(conn);
+        if (err == MPD_ERROR_SERVER) {
+          fprintf(stderr, "mpd_run_playlist_add server error code: %d\n", mpd_connection_get_server_error(conn));
+          library_songs_free(max_song_id, library, 0);
+          return 1;
+        }
+        fprintf(stderr, "mpd_run_playlist_add error: %d\n", mpd_connection_get_error(conn));
+        library_songs_free(max_song_id, library, 0);
+        return 1;
+      }
+    }
+    library_songs_free(max_song_id, library, 0);
     free(library);
   }
 
