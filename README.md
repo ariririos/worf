@@ -1,5 +1,5 @@
 # worf
-Connects an existing blissify database created by Polochon-street/blissify to MPD and creates custom playlists.
+Connects an existing blissify database created by [blissify](https://github.com/polochon-street/blissify-rs) to MPD and creates custom playlists.
 
 # Build
 Just run `make`!
