@@ -1,4 +1,6 @@
 // Credit to Polochon-street/bliss-rs
+// Modified metadata extraction to select the first stream
+// if no metadata exists on the container
 //! The default decoder module. It uses [ffmpeg](https://ffmpeg.org/) in
 //! order to decode and resample songs. A very good choice for 99% of
 //! the users.
