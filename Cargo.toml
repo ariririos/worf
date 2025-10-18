@@ -1,0 +1,29 @@
+[package]
+name = "worf"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[features]
+default = ["ffmpeg", "aubio-static"]
+ffmpeg = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next"]
+aubio-static = ["bliss-audio-aubio-rs/static"]
+
+[dependencies]
+adler32 = "1.2.0"
+anyhow = "1.0.100"
+bliss-audio = { version = "0.11.2", features = ["library", "symphonia", "symphonia-ogg", "symphonia-vorbis"] }
+bliss-audio-aubio-rs = "0.2.4"
+clap = { version = "4.5.48", features = ["derive"] }
+extended-isolation-forest = "0.2.3"
+fallible-streaming-iterator = "0.1.9"
+ffmpeg-next = { version = "8.0.0", optional = true }
+ffmpeg-sys-next = { version = "8.0.1", optional = true }
+log = "0.4.28"
+mpd = "0.1.0"
+pretty_assertions = "1.4.1"
+reqwest = { version = "0.12.23", features = ["blocking"] }
+rubato = "0.16.2"
+serde = { version = "1.0.228", features = ["derive"] }
+symphonia = { version = "0.5.4", features = ["ogg", "vorbis"] }
+thiserror = "2.0.17"

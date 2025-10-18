@@ -1,3 +1,7 @@
 .vscode/*
 .env
 worf
+
+# Added by cargo
+
+/target

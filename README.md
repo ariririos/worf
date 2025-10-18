@@ -1,28 +1,8 @@
-# worf
-Connects an existing blissify database created by [blissify](https://github.com/polochon-street/blissify-rs) to MPD and creates custom playlists.
-
-# Build
-Just run `make`!
+# Worf
+Worf is a daemon that automatically queues songs in MPD based off a "pinned song", which is just whatever song was playing when the daemon was started.
+It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
 
 # Usage
-In environment variables or a `.env` file in the project root, include:
-```
-MPD_HOST=`MPD server host` (optional, defaults to localhost)
-MPD_PORT=`MPD server port` (optional, defaults to MPD default, usually 6600)
-MPD_PASSWORD=`MPD server password` (optional)
-BLISSIFY_PASSWORD=`MPD password for the server running blissify` (optional)
-BLISS_DB=`location of the bliss-audio songs.db, usually ~/.config/bliss-rs/songs.db` **required**
-MUSIC_DIR=`MPD music directory` **required**
-```
-
-On the command line:
-`./worf`
-
-With option `--song-id`, playlist is based on Euclidean distance from that song. Song IDs are the `id` column in the `song` table in the BLISS_DB.
-With `--song-glob`, will look up song from database based on a glob pattern and then create a playlist based on Euclidean distance.
-Otherwise, playlist is randomly generated.
-
-Other options:
-`run-blissify-update`: whether to run `blissify update` to bring the blissify database up to date with the MPD server, defaults to true.
-`length`: length of the generated playlist, defaults to 50.
-`playlist-name`: name of the generated playlist, defaults to `bliss-playlist`.
+First, initialize the bliss library if not already done by running `cargo run -- --base-path $MPD_BASE_PATH init` in the project root, where `$MPD_BASE_PATH` is where music is stored (can be a network location with username/password).
+Once that's done, run `cargo run -- daemon` in the project root to start queueing similar songs.
+Use `cargo run -- update` to update the bliss library with new songs from MPD.
