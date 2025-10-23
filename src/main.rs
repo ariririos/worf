@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 // use extended_isolation_forest::ForestOptions;
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use ffmpeg_decoder::FFmpegDecoder as Decoder;
+use mpd::song::QueuePlace;
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -283,7 +284,7 @@ impl MPDLibrary {
     {
         let mut mpd_conn = self.mpd_conn.lock().unwrap();
         let path = self.bliss.config.mpd_base_path.join(&song.file);
-        let playlist = self
+        let mut playlist = self
             .bliss
             .playlist_from_custom(&[&path.to_string_lossy().clone()], distance, sort_by, dedup)?
             .skip(1);
@@ -297,31 +298,32 @@ impl MPDLibrary {
             }
         }
 
-        let mut first_additions = true;
-        for (i, bliss_song) in playlist.enumerate() {
-            if first_additions {
-                let mpd_song = self.bliss_song_to_mpd(&bliss_song)?;
-                mpd_conn.push(mpd_song)?;
-                if i > num_songs - 1 {
-                    first_additions = false;
-                }
-            } else {
-                let next_event = mpd_conn.wait(&[mpd::Subsystem::Queue])?;
+        for _ in 0..num_songs {
+            let mpd_song = self.bliss_song_to_mpd(playlist.next().as_ref().unwrap())?;
+            mpd_conn.push(mpd_song)?;
+        }
 
-                if next_event[0] == mpd::Subsystem::Queue {
-                    let new_status = mpd_conn.status()?;
-                    let last_song = last_status.song.unwrap();
-                    let new_song = new_status.song.unwrap();
-                    if new_song.pos == last_song.pos + 1 {
-                        let mpd_song = self.bliss_song_to_mpd(&bliss_song)?;
-                        mpd_conn.push(mpd_song)?;
-                        last_status = new_status;
-                    } else if new_song.id == last_song.id {
-                        last_status = new_status;
-                        continue;
-                    } else if new_status.state == mpd::status::State::Play {
-                        return Ok(mpd_conn.currentsong()?.unwrap());
-                    }
+        for bliss_song in playlist {
+            let next_event = mpd_conn.wait(&[mpd::Subsystem::Queue])?;
+
+            if next_event[0] == mpd::Subsystem::Queue {
+                let new_status = mpd_conn.status()?;
+                let last_song = last_status.song.unwrap_or(QueuePlace {pos: u32::MAX, ..Default::default()});
+                let new_song = new_status.song.unwrap_or(QueuePlace { pos: u32::MAX, ..Default::default()});
+                // FIXME: this error is probably caused by a race condition around adding the next song to the queue
+                if new_song.pos == u32::MAX || last_song.pos == u32::MAX { 
+                    println!("Failed to get next song in MPD queue, continuing with same pinned song...");
+                    continue;
+                }
+                if new_song.pos == last_song.pos + 1 {
+                    let mpd_song = self.bliss_song_to_mpd(&bliss_song)?;
+                    mpd_conn.push(mpd_song)?;
+                    last_status = new_status;
+                } else if new_song.id == last_song.id {
+                    last_status = new_status;
+                    continue;
+                } else if new_status.state == mpd::status::State::Play {
+                    return Ok(mpd_conn.currentsong()?.unwrap());
                 }
             }
         }

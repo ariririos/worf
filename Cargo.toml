@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 [dependencies]
 adler32 = "1.2.0"
 anyhow = "1.0.100"
-bliss-audio = { version = "0.11.2", features = ["library", "symphonia", "symphonia-ogg", "symphonia-vorbis"] }
+bliss-audio = { version = "0.11.2", features = ["library", "ffmpeg"] }
 bliss-audio-aubio-rs = "0.2.4"
 clap = { version = "4.5.48", features = ["derive"] }
 extended-isolation-forest = "0.2.3"
@@ -19,5 +19,4 @@ mpd = "0.1.0"
 pretty_assertions = "1.4.1"
 rubato = "0.16.2"
 serde = { version = "1.0.228", features = ["derive"] }
-symphonia = { version = "0.5.4", features = ["ogg", "vorbis"] }
 thiserror = "2.0.17"
