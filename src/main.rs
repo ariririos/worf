@@ -315,6 +315,7 @@ impl MPDLibrary {
                     println!("Failed to get next song in MPD queue, continuing with same pinned song...");
                     continue;
                 }
+                // TODO: change to start queueing when reaching the end
                 if new_song.pos == last_song.pos + 1 {
                     let mpd_song = self.bliss_song_to_mpd(&bliss_song)?;
                     mpd_conn.push(mpd_song)?;
