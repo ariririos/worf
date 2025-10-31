@@ -4,6 +4,7 @@ description = "Automatically queue similar songs in MPD, remembering the origina
 version = "0.0.1"
 edition = "2024"
 license = "GPL-3.0-only"
+repository = "https://github.com/ariririos/worf"
 
 [dependencies]
 adler32 = "1.2.0"
