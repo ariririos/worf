@@ -131,7 +131,11 @@ impl Write for MPDStream {
     }
 }
 
+/// MPDLibrary holds the connection to MPD, methods to analyze songs with bliss, and the main `queue_from_song` method
+/// that does the queueing of similar songs.
 impl MPDLibrary {
+    /// connect_to_mpd doesn't need to be called directly, building or retrieving an existing MPDLibrary
+    /// will do it for you.
     fn connect_to_mpd() -> Result<Client<MPDStream>> {
         let (password, mpd_host) = match env::var("MPD_HOST") {
             Ok(h) => match h.split_once('@') {
@@ -178,6 +182,9 @@ impl MPDLibrary {
         Ok(client)
     }
 
+    /// Build a new MPDLibrary. May fail if paths provided don't exist or if an error occurs connecting to MPD.
+    /// If no paths are provided for `config_path` or `database_path`, bliss will default to locations in
+    /// $XDG_CONFIG_HOME.
     fn build(
         mpd_base_path: PathBuf,
         config_path: Option<PathBuf>,
@@ -190,6 +197,8 @@ impl MPDLibrary {
         })
     }
 
+    /// Retrieve an existing MPDLibrary from disk. May fail if path provided doesn't exist or if an error occurs
+    /// connecting to MPD. If no path is provided, bliss will look up a configuration in $XDG_CONFIG_HOME.
     fn retrieve(config_path: Option<PathBuf>) -> Result<Self> {
         Ok(Self {
             bliss: Library::from_config_path(config_path)?,
@@ -197,6 +206,7 @@ impl MPDLibrary {
         })
     }
 
+    // Gets all songs from MPD. May fail if the MPD connection is dropped.
     fn get_all_mpd_songs(&self) -> Result<Vec<String>> {
         let mut songs = vec![];
         let mut query = Query::new();
@@ -226,6 +236,9 @@ impl MPDLibrary {
         Ok(songs)
     }
 
+    /// Analyzes all songs in MPD's database with bliss. May fail if the database connection is dropped,
+    /// if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will
+    /// typically continue even if individual songs fail.
     fn populate(&mut self) -> Result<()> {
         let sqlite_conn = self.bliss.sqlite_conn.lock().unwrap();
         let mut songs_query = sqlite_conn.prepare("select * from song")?;
@@ -260,6 +273,7 @@ impl MPDLibrary {
         self.bliss.analyze_paths(self.get_all_mpd_songs()?, true)
     }
 
+    /// Converts a [bliss_audio::library::LibrarySong] to an [mpd::song::Song].
     fn bliss_song_to_mpd(&self, song: &BlissSong<()>) -> Result<MPDSong> {
         let path = song.bliss_song.path.to_owned();
         let path = path.strip_prefix(&*self.bliss.config.mpd_base_path.to_string_lossy())?;
@@ -269,6 +283,11 @@ impl MPDLibrary {
         })
     }
 
+    /// The meat of `worf`. Continuously queues songs from the MPD library based on similarity to the song passed as
+    /// argument until it reaches the end of the user's library. The distance metric can be customized, as well as 
+    /// the sort function. May fail if the database connection is dropped, if bliss fails to create a playlist,
+    /// if the song passed in has not been analyzed, or if MPD gets confused when the user makes a lot of changes
+    /// to the queue in quick succession (working on ways around this).
     fn queue_from_song<'a, F, I>(
         &self,
         song: &MPDSong,
