@@ -10,6 +10,7 @@
  * TODO:
  * - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags. 
  * - In a separate thread, keep the bliss database updated as new songs are added to MPD.
+ * - Ultimately, the idea of keeping state about the "pinned song" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
  */
 
 pub mod ffmpeg_decoder;
@@ -54,7 +55,6 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Daemon,
-    Playlist,
     Update,
     Init,
 }
@@ -401,10 +401,6 @@ fn main() -> Result<()> {
                     Err(e) => bail!(e),
                 }
             }
-        }
-        Some(Commands::Playlist) => {
-            println!("Building a playlist...");
-            todo!()
         }
         Some(Commands::Init) => {
             println!("Initializing music library and analyzing...");
