@@ -1,7 +1,7 @@
 [package]
 name = "worf"
 description = "Automatically queue similar songs in MPD, remembering the original song."
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/ariririos/worf"
