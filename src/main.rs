@@ -1,30 +1,36 @@
+#![feature(slice_as_array)]
 /**
  * Worf 0.0.1
  * Copyright (c) 2025 Ari Rios <me@aririos.com>
  * License-SPDX: GPL-3.0-only
  * Based on Polochon-street/blissify-rs
- * 
+ *
  * Worf is a daemon that automatically queues songs in MPD based off a "pinned song", which is just whatever song was playing when the daemon was started.
  * It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
- * 
+ *
  * TODO:
- * - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags. 
+ * - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags.
  * - In a separate thread, keep the bliss database updated as new songs are added to MPD.
  * - Ultimately, the idea of keeping state about the "pinned song" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
  */
-
 pub mod ffmpeg_decoder;
 use anyhow::{Context, Result, anyhow, bail};
 use bliss_audio::AnalysisOptions;
+use bliss_audio::Song as BareBlissSong;
 use bliss_audio::library::{AppConfigTrait, BaseConfig, Library, LibrarySong as BlissSong};
-use bliss_audio::playlist::{closest_to_songs, euclidean_distance, DistanceMetricBuilder};
+use bliss_audio::playlist::{DistanceMetricBuilder, closest_to_songs, euclidean_distance};
 use clap::{Parser, Subcommand};
 // use extended_isolation_forest::ForestOptions;
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use ffmpeg_decoder::FFmpegDecoder as Decoder;
+use itertools::Itertools;
 use mpd::song::QueuePlace;
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
+use ndarray::{Array1, arr1};
+use noisy_float::prelude::n32;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::linux::net::SocketAddrExt;
@@ -54,15 +60,17 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    Genres,
     Daemon,
     Update,
     Init,
 }
 
-/// The main struct which holds the [bliss_audio::library::Library] and [mpd::Client].
+/// The main struct which holds the [bliss_audio::library::Library] and [mpd::Client]. Also holds the genre weightings ([GenreWeights]) if present.
 struct MPDLibrary {
     bliss: Library<Config, Decoder>,
     mpd_conn: Arc<Mutex<Client<MPDStream>>>,
+    genre_weights: Option<GenreWeights>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -131,6 +139,36 @@ impl Write for MPDStream {
     }
 }
 
+fn average(v: &[f32]) -> f32 {
+    if v.len() > 0 {
+        v.iter().sum::<f32>() / v.len() as f32
+    } else {
+        0.0
+    }
+}
+
+fn vec_avg<const N: usize>(v: Vec<Vec<f32>>) -> Vec<f32> {
+    (0..N)
+        .map(|i| average(&v.iter().map(|arr| arr[i]).collect::<Vec<_>>()))
+        .collect()
+}
+
+fn collapse_genres(genre_weights: &GenreWeights, genres: String) -> Vec<f32> {
+    if genres.is_empty() {
+        return vec![0.0; 5];
+    }
+    vec_avg::<5>(
+        genres
+            .split(",")
+            .filter_map(|genre| genre_weights.get(genre))
+            .map(|weights| weights.iter().map(|v| *v as f32).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    )
+}
+
+type GenreWeights = HashMap<String, Vec<f32>>;
+type TrackWeights = HashMap<String, Vec<f32>>;
+
 /// MPDLibrary holds the connection to MPD, methods to analyze songs with bliss, and the main `queue_from_song` method
 /// that does the queueing of similar songs.
 impl MPDLibrary {
@@ -194,6 +232,7 @@ impl MPDLibrary {
         Ok(Self {
             bliss: Library::new(config)?,
             mpd_conn: Arc::new(Mutex::new(Self::connect_to_mpd()?)),
+            genre_weights: None,
         })
     }
 
@@ -203,6 +242,7 @@ impl MPDLibrary {
         Ok(Self {
             bliss: Library::from_config_path(config_path)?,
             mpd_conn: Arc::new(Mutex::new(Self::connect_to_mpd()?)),
+            genre_weights: None,
         })
     }
 
@@ -273,6 +313,21 @@ impl MPDLibrary {
         self.bliss.analyze_paths(self.get_all_mpd_songs()?, true)
     }
 
+    /// Gets the bliss path of an [mpd::song::Song] by prepending the MPD base path.
+    fn mpd_to_bliss_path(&self, mpd_song: &MPDSong) -> Result<PathBuf> {
+        let file = &mpd_song.file;
+        let path = file.to_string();
+        let path = &self.bliss.config.mpd_base_path.join(PathBuf::from(&path));
+        Ok(path.to_path_buf())
+    }
+
+    /// Converts an [mpd::song::Song] to a [bliss_audio::library::LibrarySong], if previously analyzed.
+    fn mpd_to_bliss_song(&self, mpd_song: &MPDSong) -> Result<Option<BlissSong<()>>> {
+        let path = self.mpd_to_bliss_path(mpd_song)?;
+        let song = self.bliss.song_from_path(&path.to_string_lossy()).ok();
+        Ok(song)
+    }
+
     /// Converts a [bliss_audio::library::LibrarySong] to an [mpd::song::Song].
     fn bliss_song_to_mpd(&self, song: &BlissSong<()>) -> Result<MPDSong> {
         let path = song.bliss_song.path.to_owned();
@@ -284,7 +339,7 @@ impl MPDLibrary {
     }
 
     /// The meat of `worf`. Continuously queues songs from the MPD library based on similarity to the song passed as
-    /// argument until it reaches the end of the user's library. The distance metric can be customized, as well as 
+    /// argument until it reaches the end of the user's library. The distance metric can be customized, as well as
     /// the sort function. May fail if the database connection is dropped, if bliss fails to create a playlist,
     /// if the song passed in has not been analyzed, or if MPD gets confused when the user makes a lot of changes
     /// to the queue in quick succession (working on ways around this).
@@ -327,11 +382,19 @@ impl MPDLibrary {
 
             if next_event[0] == mpd::Subsystem::Queue {
                 let new_status = mpd_conn.status()?;
-                let last_song = last_status.song.unwrap_or(QueuePlace {pos: u32::MAX, ..Default::default()});
-                let new_song = new_status.song.unwrap_or(QueuePlace { pos: u32::MAX, ..Default::default()});
+                let last_song = last_status.song.unwrap_or(QueuePlace {
+                    pos: u32::MAX,
+                    ..Default::default()
+                });
+                let new_song = new_status.song.unwrap_or(QueuePlace {
+                    pos: u32::MAX,
+                    ..Default::default()
+                });
                 // FIXME: this error is probably caused by a race condition around adding the next song to the queue
-                if new_song.pos == u32::MAX || last_song.pos == u32::MAX { 
-                    println!("Failed to get next song in MPD queue, continuing with same pinned song...");
+                if new_song.pos == u32::MAX || last_song.pos == u32::MAX {
+                    println!(
+                        "Failed to get next song in MPD queue, continuing with same pinned song..."
+                    );
                     continue;
                 }
                 // TODO: change to start queueing when reaching the end
@@ -350,6 +413,25 @@ impl MPDLibrary {
 
         Ok(song.clone())
     }
+
+    /// Loads genre weights from disk and associates them with tracks in the bliss library. May fail if the weights are not found or
+    /// if the bliss library is corrupted.
+    fn get_track_genre_weights(&mut self) -> Result<TrackWeights> {
+        let all_bliss_songs = self.bliss.songs_from_library::<()>()?;
+
+        let genre_weights: GenreWeights = serde_json::from_reader(File::open("./genres.json")?)?;
+        self.genre_weights = Some(genre_weights.clone());
+
+        let mut genre_weights_by_track_path: TrackWeights = HashMap::new();
+        for song in all_bliss_songs {
+            if let Some(genres) = song.bliss_song.genre {
+                genre_weights_by_track_path
+                    .entry(song.bliss_song.path.to_str().unwrap().to_owned())
+                    .or_insert(collapse_genres(&genre_weights, genres));
+            }
+        }
+        Ok(genre_weights_by_track_path)
+    }
 }
 
 struct PinnedSong(MPDSong);
@@ -358,6 +440,119 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
+        Some(Commands::Genres) => {
+            println!("Queueing {} songs and daemonizing...", args.queue_length);
+            let config_path = args.config_path;
+            let mut mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
+                Ok(library) => library,
+                Err(e) => match e.downcast::<std::io::Error>() {
+                    Ok(inner) => match inner.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            let database_path: Option<PathBuf> = None;
+                            MPDLibrary::build(args.base_path.ok_or(anyhow!("--base-path must be used if running `daemon` without an initialized library"))?, config_path, database_path)?
+                        }
+                        kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
+                    },
+                    Err(inner_err) => bail!(
+                        "Could not retrieve or create MPDLibrary (failed to downcast MPDLibrary::retrieve error: {inner_err})"
+                    ),
+                },
+            };
+            let track_weights = mpd_library.get_track_genre_weights()?;
+
+            /// A modified version of the bliss default playlist creator, sorting by genre weights.
+            fn closest_to_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
+                initial_songs: &[T],
+                candidate_songs: &[T],
+                metric_builder: &'a dyn DistanceMetricBuilder,
+                track_weights: &GenreWeights,
+            ) -> impl Iterator<Item = T> + 'a {
+                let initial_songs: Vec<Array1<f32>> = initial_songs
+                    .iter()
+                    .filter_map(|c| Some(arr1(track_weights.get(c.as_ref().path.to_str()?)?)))
+                    .collect::<Vec<_>>();
+                let metric = metric_builder.build(&initial_songs);
+                let mut candidate_songs = candidate_songs.to_vec();
+                candidate_songs.sort_by_cached_key(|song| {
+                    n32(metric.distance(&arr1(
+                        track_weights
+                            .get(song.as_ref().path.to_str().unwrap())
+                            .unwrap_or(&vec![0.0; 5]),
+                    )))
+                });
+                candidate_songs.into_iter()
+            }
+
+            let sort = |x: &[BlissSong<()>],
+                        y: &[BlissSong<()>],
+                        z|
+             -> Box<dyn Iterator<Item = BlissSong<()>>> {
+                Box::new(closest_to_songs(x, y, z, &track_weights))
+            };
+
+            let Ok(Some(current_song)) = mpd_library.mpd_conn.lock().unwrap().currentsong() else {
+                bail!("Start playing a song and try again.");
+            };
+
+            let mut pinned_song = PinnedSong(current_song);
+
+            loop {
+                let current_genre = mpd_library
+                    .mpd_to_bliss_song(&pinned_song.0)
+                    .unwrap()
+                    .unwrap()
+                    .bliss_song
+                    .genre
+                    .unwrap_or_default();
+                let current_genre_weight = collapse_genres(
+                    &mpd_library.genre_weights.clone().unwrap(),
+                    current_genre.clone(),
+                );
+                println!("Current genre: {}", current_genre);
+                println!(
+                    "Closest 10 genres: {}",
+                    mpd_library
+                        .genre_weights
+                        .clone()
+                        .unwrap()
+                        .iter()
+                        .sorted_by(|a, b| euclidean_distance(
+                            &arr1(current_genre_weight.as_array::<5>().unwrap()),
+                            &arr1(a.1.as_array::<5>().unwrap())
+                        )
+                        .total_cmp(&euclidean_distance(
+                            &arr1(current_genre_weight.as_array::<5>().unwrap()),
+                            &arr1(b.1.as_array::<5>().unwrap())
+                        )))
+                        .map(|(name, _)| name)
+                        .take(10)
+                        .join(",")
+                );
+
+                match mpd_library.queue_from_song(
+                    &pinned_song.0,
+                    10,
+                    &euclidean_distance,
+                    sort,
+                    true,
+                    false,
+                ) {
+                    Ok(next_pinned) => {
+                        if next_pinned == pinned_song.0 {
+                            println!("You made it to the end of your music library!");
+                            return Ok(());
+                        }
+                        pinned_song = PinnedSong(next_pinned);
+                        println!(
+                            "Restarting with new pinned song: {}",
+                            pinned_song.0.title.as_ref().unwrap()
+                        );
+                        continue;
+                    }
+                    Err(e) => bail!(e),
+                }
+            }
+        }
         Some(Commands::Daemon) => {
             println!("Queueing {} songs and daemonizing...", args.queue_length);
             let config_path = args.config_path;
@@ -383,7 +578,10 @@ fn main() -> Result<()> {
 
             let mut pinned_song = PinnedSong(current_song);
 
-            println!("Queueing from pinned song: {}", pinned_song.0.title.as_ref().unwrap());
+            println!(
+                "Queueing from pinned song: {}",
+                pinned_song.0.title.as_ref().unwrap()
+            );
 
             let sort = |x: &[BlissSong<()>],
                         y: &[BlissSong<()>],
@@ -414,7 +612,10 @@ fn main() -> Result<()> {
                             return Ok(());
                         }
                         pinned_song = PinnedSong(next_pinned);
-                        println!("Restarting with new pinned song: {}", pinned_song.0.title.as_ref().unwrap());
+                        println!(
+                            "Restarting with new pinned song: {}",
+                            pinned_song.0.title.as_ref().unwrap()
+                        );
                         continue;
                     }
                     Err(e) => bail!(e),

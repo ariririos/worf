@@ -16,9 +16,14 @@ extended-isolation-forest = "0.2.3"
 fallible-streaming-iterator = "0.1.9"
 ffmpeg-next = { version = "8.0.0" }
 ffmpeg-sys-next = { version = "8.0.1" }
+itertools = "0.14.0"
 log = "0.4.28"
 mpd = "0.1.0"
+ndarray = "0.16.1"
+noisy_float = "0.2.0"
+num-traits = "0.2.19"
 pretty_assertions = "1.4.1"
 rubato = "0.16.2"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 thiserror = "2.0.17"
