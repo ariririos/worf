@@ -2,7 +2,6 @@
 // * Copyright (c) 2025 Ari Rios <me@aririos.com>
 // * License-SPDX: GPL-3.0-only
 // * Based on Polochon-street/blissify-rs
-#![feature(slice_as_array)]
 //!
 //! Worf is a daemon that automatically queues songs in MPD based off a "pinned song", which is just whatever song was playing when the daemon was started.
 //! It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
@@ -435,6 +434,24 @@ impl MPDLibrary {
 
 struct PinnedSong(MPDSong);
 
+/// Gets a reference to the underlying array.
+///
+/// If `N` is not exactly equal to the length of `v`, then this function returns `None`.
+/// Copied from rust/library/core/src/slice/mod.rs
+#[inline]
+#[must_use]
+pub const fn slice_as_array<const N: usize, T>(v: &[T]) -> Option<&[T; N]> {
+    if v.len() == N {
+        let ptr = v.as_ptr().cast();
+
+        // SAFETY: The underlying array of a slice can be reinterpreted as an actual array `[T; N]` if `N` is not greater than the slice's length.
+        let me = unsafe { &*ptr };
+        Some(me)
+    } else {
+        None
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -460,7 +477,7 @@ fn main() -> Result<()> {
             let track_weights = mpd_library.get_track_genre_weights()?;
 
             /// A modified version of the bliss default playlist creator, sorting by genre weights.
-            fn closest_to_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
+            fn closest_to_genre_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
                 initial_songs: &[T],
                 candidate_songs: &[T],
                 metric_builder: &'a dyn DistanceMetricBuilder,
@@ -482,11 +499,18 @@ fn main() -> Result<()> {
                 candidate_songs.into_iter()
             }
 
-            let sort = |x: &[BlissSong<()>],
+            let genre_sort = |x: &[BlissSong<()>],
                         y: &[BlissSong<()>],
                         z|
              -> Box<dyn Iterator<Item = BlissSong<()>>> {
-                Box::new(closest_to_songs(x, y, z, &track_weights))
+                Box::new(closest_to_genre_songs(x, y, z, &track_weights))
+            };
+
+            let bliss_sort = |x: &[BlissSong<()>],
+                        y: &[BlissSong<()>],
+                        z|
+             -> Box<dyn Iterator<Item = BlissSong<()>>> {
+                Box::new(closest_to_songs(x, y, z))
             };
 
             let Ok(Some(current_song)) = mpd_library.mpd_conn.lock().unwrap().currentsong() else {
@@ -516,39 +540,67 @@ fn main() -> Result<()> {
                         .unwrap()
                         .iter()
                         .sorted_by(|a, b| euclidean_distance(
-                            &arr1(current_genre_weight.as_array::<5>().unwrap()),
-                            &arr1(a.1.as_array::<5>().unwrap())
+                            &arr1(slice_as_array::<5, f32>(&current_genre_weight).unwrap()),
+                            &arr1(slice_as_array::<5, f32>(a.1).unwrap())
                         )
                         .total_cmp(&euclidean_distance(
-                            &arr1(current_genre_weight.as_array::<5>().unwrap()),
-                            &arr1(b.1.as_array::<5>().unwrap())
+                            &arr1(slice_as_array::<5, f32>(&current_genre_weight).unwrap()),
+                            &arr1(slice_as_array::<5, f32>(b.1).unwrap())
                         )))
                         .map(|(name, _)| name)
                         .take(10)
                         .join(",")
                 );
 
-                match mpd_library.queue_from_song(
-                    &pinned_song.0,
-                    10,
-                    &euclidean_distance,
-                    sort,
-                    true,
-                    false,
-                ) {
-                    Ok(next_pinned) => {
-                        if next_pinned == pinned_song.0 {
-                            println!("You made it to the end of your music library!");
-                            return Ok(());
+                // TODO: once #![feature(closure_lifetime_binder)] is stable, combine these if/else branches 
+                if current_genre.is_empty() {
+                    println!("No genre available, defaulting to bliss analysis queueing...");
+                    match mpd_library.queue_from_song(
+                        &pinned_song.0,
+                        10,
+                        &euclidean_distance,
+                        bliss_sort,
+                        true,
+                        false,
+                    ) {
+                        Ok(next_pinned) => {
+                            if next_pinned == pinned_song.0 {
+                                println!("You made it to the end of your music library!");
+                                return Ok(());
+                            }
+                            pinned_song = PinnedSong(next_pinned);
+                            println!(
+                                "Restarting with new pinned song: {}",
+                                pinned_song.0.title.as_ref().unwrap()
+                            );
+                            continue;
                         }
-                        pinned_song = PinnedSong(next_pinned);
-                        println!(
-                            "Restarting with new pinned song: {}",
-                            pinned_song.0.title.as_ref().unwrap()
-                        );
-                        continue;
+                        Err(e) => bail!(e),
                     }
-                    Err(e) => bail!(e),
+                }
+                else {
+                    match mpd_library.queue_from_song(
+                        &pinned_song.0,
+                        10,
+                        &euclidean_distance,
+                        genre_sort,
+                        true,
+                        false,
+                    ) {
+                        Ok(next_pinned) => {
+                            if next_pinned == pinned_song.0 {
+                                println!("You made it to the end of your music library!");
+                                return Ok(());
+                            }
+                            pinned_song = PinnedSong(next_pinned);
+                            println!(
+                                "Restarting with new pinned song: {}",
+                                pinned_song.0.title.as_ref().unwrap()
+                            );
+                            continue;
+                        }
+                        Err(e) => bail!(e),
+                    }
                 }
             }
         }
@@ -601,7 +653,7 @@ fn main() -> Result<()> {
                     &pinned_song.0,
                     10,
                     &euclidean_distance,
-                    sort,
+                    &sort,
                     true,
                     false,
                 ) {
