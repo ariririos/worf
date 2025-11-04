@@ -1,18 +1,17 @@
+// Worf 0.0.1
+// * Copyright (c) 2025 Ari Rios <me@aririos.com>
+// * License-SPDX: GPL-3.0-only
+// * Based on Polochon-street/blissify-rs
 #![feature(slice_as_array)]
-/**
- * Worf 0.0.1
- * Copyright (c) 2025 Ari Rios <me@aririos.com>
- * License-SPDX: GPL-3.0-only
- * Based on Polochon-street/blissify-rs
- *
- * Worf is a daemon that automatically queues songs in MPD based off a "pinned song", which is just whatever song was playing when the daemon was started.
- * It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
- *
- * TODO:
- * - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags.
- * - In a separate thread, keep the bliss database updated as new songs are added to MPD.
- * - Ultimately, the idea of keeping state about the "pinned song" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
- */
+//!
+//! Worf is a daemon that automatically queues songs in MPD based off a "pinned song", which is just whatever song was playing when the daemon was started.
+//! It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
+
+// TODO:
+// - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags.
+// - In a separate thread, keep the bliss database updated as new songs are added to MPD.
+// - Ultimately, the idea of keeping state about the "pinned song" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
+
 pub mod ffmpeg_decoder;
 use anyhow::{Context, Result, anyhow, bail};
 use bliss_audio::AnalysisOptions;
