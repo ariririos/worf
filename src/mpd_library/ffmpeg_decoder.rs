@@ -5,28 +5,27 @@
 //! order to decode and resample songs. A very good choice for 99% of
 //! the users.
 
+use ::log::warn;
 use bliss_audio::decoder::{Decoder, PreAnalyzedSong};
 use bliss_audio::{BlissError, BlissResult};
-use ::log::warn;
-use ffmpeg_next::{self, DictionaryRef};
 use ffmpeg_next::codec::threading::{Config, Type as ThreadingType};
 use ffmpeg_next::util::channel_layout::ChannelLayout;
-use ffmpeg_next::util::error::Error;
 use ffmpeg_next::util::error::EINVAL;
+use ffmpeg_next::util::error::Error;
 use ffmpeg_next::util::format::sample::{Sample, Type};
 use ffmpeg_next::util::frame::audio::Audio;
 use ffmpeg_next::util::log;
 use ffmpeg_next::util::log::level::Level;
+use ffmpeg_next::{self, DictionaryRef};
 use ffmpeg_next::{media, util};
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::Duration;
-use std::path::Path;
 
 const CHANNELS: u16 = 1;
 const SAMPLE_RATE: u32 = 22050;
-
 
 /// The actual FFmpeg decoder.
 ///
@@ -204,26 +203,29 @@ impl Decoder for FFmpegDecoder {
             (decoder, input.index(), expected_sample_number)
         };
         let sample_array: Vec<f32> = Vec::with_capacity(expected_sample_number as usize);
-        
+
         enum ContextOrStream<'a> {
             Context(&'a ffmpeg_next::format::context::Input),
-            Stream(&'a ffmpeg_next::Stream<'a>)
+            Stream(&'a ffmpeg_next::Stream<'a>),
         }
         impl<'a> ContextOrStream<'a> {
             fn metadata(&'a self) -> DictionaryRef<'a> {
                 match self {
-                    &ContextOrStream::Context(ictx) => ictx.metadata(),
-                    &ContextOrStream::Stream(input) => input.metadata()
+                    ContextOrStream::Context(ictx) => ictx.metadata(),
+                    ContextOrStream::Stream(input) => input.metadata(),
                 }
             }
         }
-        let context_or_stream  = if ictx.metadata().iter()
-        .count() != 0 { ContextOrStream::Context(&ictx) } else { ContextOrStream::Stream(&ictx.streams().best(media::Type::Audio).ok_or_else(|| {
-            BlissError::DecodingError(format!(
-                "No audio stream found for file '{}'.",
-                path.display()
-            ))
-        })?) };
+        let context_or_stream = if ictx.metadata().iter().count() != 0 {
+            ContextOrStream::Context(&ictx)
+        } else {
+            ContextOrStream::Stream(&ictx.streams().best(media::Type::Audio).ok_or_else(|| {
+                BlissError::DecodingError(format!(
+                    "No audio stream found for file '{}'.",
+                    path.display()
+                ))
+            })?)
+        };
         if let Some(title) = context_or_stream.metadata().get("title") {
             song.title = match title {
                 "" => None,
@@ -312,7 +314,7 @@ impl Decoder for FFmpegDecoder {
                     return Err(BlissError::DecodingError(format!(
                         "wrong codec opened for file '{}.",
                         path.display(),
-                    )))
+                    )));
                 }
                 Err(Error::Eof) => {
                     warn!(
@@ -351,7 +353,7 @@ impl Decoder for FFmpegDecoder {
                 return Err(BlissError::DecodingError(format!(
                     "wrong codec opened for file '{}'.",
                     path.display()
-                )))
+                )));
             }
             Err(Error::Eof) => {
                 warn!(
