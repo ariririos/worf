@@ -10,7 +10,7 @@ Use `worf update` to update the bliss library with new songs from MPD.
 ## By genres (experimental!)
 Credit to Glenn McDonald and Spotify for the [Every Noise at Once](https://everynoise.com) project, which provides similarity metrics for Spotify's genre tags. If your music is tagged accordingly, such as with [Zotify](https://github.com/Googolplexed0/zotify) (or my [zotify-genre-tagger](https://github.com/ariririos/zotify-genre-tagger) if you forgot to enable genre tagging), worf can queue music by genre similarity. While this prevents the sort of "drifting" that purely audio-based similarity metrics might cause, in my experience, it often leads to the opposite problem of staying too close in a genre bubble.
 
-You can try it with `worf genres`. You will need a genres.json file in the same directory, with genre names as the keys and a 5-element array of integers as the values. I won't post it directly here, but you can acquire your own copy with this Javascript on everynoise.net:
+You can try it with `worf genres`. You will need a genres.json file in the same directory, with genre names as the keys and a 5-element array of integers as the values. I won't post it directly here, but you can acquire your own copy with this Javascript on everynoise.com:
 ```Javascript
 let weights = {};
 for (let node of Array.from(document.querySelectorAll(".canvas .genre"))) {
