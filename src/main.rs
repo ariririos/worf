@@ -267,7 +267,7 @@ fn main() -> Result<()> {
                 .update_library(mpd_library.get_all_mpd_songs()?, true, true)
         }
         None => {
-            panic!("No command provided!");
+            bail!("No command provided!");
         }
     }
 }

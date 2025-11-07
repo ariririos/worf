@@ -105,15 +105,16 @@ fn vec_avg<const N: usize>(v: Vec<Vec<f32>>) -> Vec<f32> {
 
 pub fn collapse_genres(genre_weights: &GenreWeights, genres: String) -> Vec<f32> {
     if genres.is_empty() {
-        return vec![0.0; 5];
+        vec![0.0; 5]
+    } else {
+        vec_avg::<5>(
+            genres
+                .split(",")
+                .filter_map(|genre| genre_weights.get(genre))
+                .map(|weights| weights.to_owned())
+                .collect::<Vec<_>>(),
+        )
     }
-    vec_avg::<5>(
-        genres
-            .split(",")
-            .filter_map(|genre| genre_weights.get(genre))
-            .map(|weights| weights.to_owned())
-            .collect::<Vec<_>>(),
-    )
 }
 
 /// A modified version of the bliss default playlist creator, sorting by genre weights.
@@ -169,6 +170,7 @@ pub struct MPDLibrary {
     pub mpd_conn: Arc<Mutex<Client<MPDStream>>>,
     pub genre_weights: Option<GenreWeights>,
 }
+
 /// MPDLibrary holds the connection to MPD, methods to analyze songs with bliss, and the main `queue_from_song` method
 /// that does the queueing of similar songs.
 impl MPDLibrary {
@@ -427,8 +429,8 @@ impl MPDLibrary {
         Ok(song.clone())
     }
 
-    /// Loads genre weights from disk and associates them with tracks in the bliss library. May fail if the weights are not found or
-    /// if the bliss library is corrupted.
+    /// Loads genre weights from disk and associates them with tracks in the bliss library. May fail if the weights are not found,
+    /// if they're in the wrong format, or if the bliss library is corrupted.
     pub fn get_track_genre_weights(&mut self) -> Result<TrackWeights> {
         let all_bliss_songs = self.bliss.songs_from_library::<()>().context("while getting bliss library")?;
 
