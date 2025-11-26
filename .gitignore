@@ -1,6 +1,7 @@
 .vscode/*
 .env
 genres.json
+public/node_modules/*
 
 # Added by cargo
 

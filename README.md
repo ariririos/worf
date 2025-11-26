@@ -1,6 +1,6 @@
 # Worf
-Worf is a daemon that automatically queues songs in MPD based on a "pinned song", which is just whatever song was playing when the daemon was started.
-It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
+Worf is a daemon that automatically queues songs in MPD based on a "pin", which is just whatever song was playing when the daemon was started.
+It uses bliss-audio to queue songs that are most similar to the pin. The pin is changed simply by playing a new song.
 
 # Usage
 First, initialize the bliss library if not already done by running `worf --base-path $MPD_BASE_PATH init` in the project root, where `$MPD_BASE_PATH` is where music is stored (can be a network location with username/password).

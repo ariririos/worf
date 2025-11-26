@@ -3,13 +3,13 @@
 // * License-SPDX: GPL-3.0-only
 // * Based on Polochon-street/blissify-rs
 //!
-//! Worf is a daemon that automatically queues songs in MPD based off a "pinned song", which is just whatever song was playing when the daemon was started.
-//! It uses bliss-audio to queue songs that are most similar to the pinned song. The pinned song is changed simply by playing a new song.
+//! Worf is a daemon that automatically queues songs in MPD based off a "pin", which is just whatever song was playing when the daemon was started.
+//! It uses bliss-audio to queue songs that are most similar to the pin. The pin is changed simply by playing a new song.
 
 // TODO:
 // - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags.
 // - In a separate thread, keep the bliss database updated as new songs are added to MPD.
-// - Ultimately, the idea of keeping state about the "pinned song" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
+// - Ultimately, the idea of keeping state about the "pin" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
 
 mod mpd_library;
 
@@ -20,38 +20,121 @@ use clap::{Parser, Subcommand};
 // use extended_isolation_forest::ForestOptions;
 use itertools::Itertools;
 use mpd::Song as MPDSong;
-use mpd_library::{MPDLibrary, collapse_genres, slice_as_array, closest_to_genre_songs};
+use mpd_library::{MPDLibrary, closest_to_genre_songs, collapse_genres, slice_as_array};
 use ndarray::arr1;
+use rocket::Config;
+use rocket::fs::{FileServer, Options, relative};
+use rocket::{State, get, http::Status, routes, serde::json::Json};
+use serde::Serialize;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(name = "Worf", version, about, long_about = None)]
 struct Args {
+    /// How many songs to queue up
     #[arg(long, default_value_t = 10)]
     queue_length: u8,
+    /// MPD base path
     #[arg(short, long)]
     base_path: Option<PathBuf>,
+    /// Bliss config path
     #[arg(short, long)]
     config_path: Option<PathBuf>,
+    /// Bliss database path
     #[arg(short, long)]
     database_path: Option<PathBuf>,
+    /// MPD password
     #[arg(short, long)]
     password: Option<String>,
+    #[arg(short, long, default_value_t = true)]
+    /// Whether to update bliss library on `genres`, `daemon`, and `server` commands
+    update_library: bool,
+    #[arg(short, long)]
+    /// Path of genre map JSON file
+    genres_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Queue songs based on genre similarity
     Genres,
+    /// Queue songs based on audio similarity from bliss
     Daemon,
+    /// Serve analysis over the network
+    Server {
+        /// Where to bind the server. Possible formats are `address`, `address:port`, `:port`
+        bind_to: Option<String> },
+    /// Update bliss library
     Update,
+    /// Initialize (or reinitialize) bliss library
     Init,
+}
+
+// #[get("/<artist>/<album>/<song>")]
+// fn analysis(artist: &str, album: &str, song: &str, state: &State<MPDLibrary>) -> std::result::Result<Json<Vec<f32>>, NotFound<String>> {
+//     let path = PathBuf::new();
+//     let path = path.join(state.mpd_base_path.clone()).join(artist).join(album).join(song);
+//     println!("path: {}", path.display());
+//     Ok(Json(state.bliss.song_from_path::<()>(path.to_str().context("Path should have been Unicode").map_err(|e| NotFound(e.to_string()))?).context("Song does not exist in bliss database").map_err(|e| NotFound(e.to_string()))?.bliss_song.analysis.as_vec()))
+// }
+
+#[derive(Serialize, Clone)]
+struct ClientSong {
+    path: PathBuf,
+    analysis: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct AllSongsPage {
+    page: u32,
+    songs: Vec<ClientSong>,
+}
+
+const CHUNK_SIZE: u32 = 50;
+
+#[get("/all/<page>")]
+fn all(
+    page: u32,
+    state: &State<Vec<ClientSong>>,
+) -> std::result::Result<Json<AllSongsPage>, Status> {
+    if page > (state.len() as f32 / CHUNK_SIZE as f32).floor() as u32 {
+        return Err(Status::BadRequest);
+    }
+    let start_idx = (CHUNK_SIZE * page) as usize;
+    let end_idx = (CHUNK_SIZE * (page + 1)) as usize;
+    let songs_page = if start_idx > state.len() - 1 && end_idx > state.len() - 1 {
+        return Err(Status::InternalServerError);
+    } else if end_idx > state.len() - 1 {
+        state[start_idx..].to_vec()
+    } else {
+        state[start_idx..end_idx].to_vec()
+    };
+    Ok(Json(AllSongsPage {
+        page,
+        songs: songs_page,
+    }))
+}
+
+#[derive(Serialize)]
+struct Info {
+    max_page: u32,
+}
+
+#[get("/info")]
+fn info(state: &State<Vec<ClientSong>>) -> Json<Info> {
+    Json(Info {
+        max_page: (state.len() as f32 / CHUNK_SIZE as f32).floor() as u32,
+    })
 }
 
 struct PinnedSong(MPDSong);
 
-fn main() -> Result<()> {
+#[rocket::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
@@ -63,8 +146,7 @@ fn main() -> Result<()> {
                 Err(e) => match e.downcast::<std::io::Error>() {
                     Ok(inner) => match inner.kind() {
                         std::io::ErrorKind::NotFound => {
-                            let database_path: Option<PathBuf> = None;
-                            MPDLibrary::build(args.base_path.ok_or(anyhow!("--base-path must be used if running `daemon` without an initialized library"))?, config_path, database_path)?
+                            bail!("Must initialize library first using `worf init`")
                         }
                         kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
                     },
@@ -73,7 +155,7 @@ fn main() -> Result<()> {
                     ),
                 },
             };
-            let track_weights = mpd_library.get_track_genre_weights()?;
+            let track_weights = mpd_library.get_track_genre_weights(args.genres_path)?;
 
             let genre_sort = |x: &[BlissSong<()>],
                               y: &[BlissSong<()>],
@@ -89,11 +171,21 @@ fn main() -> Result<()> {
                 Box::new(closest_to_songs(x, y, z))
             };
 
-            let Ok(Some(current_song)) = mpd_library.mpd_conn.lock().expect("Poisoned lock").currentsong() else {
-                bail!("Start playing a song and try again.");
-            };
+            if args.update_library {
+                mpd_library
+                    .bliss
+                    .update_library(mpd_library.get_all_mpd_songs()?, true, true)
+                    .context("while updating bliss library")?;
+            }
+
+            let current_song = mpd_library.get_current_song()?;
 
             let mut pinned_song = PinnedSong(current_song);
+
+            println!(
+                "Starting with pin {}",
+                pinned_song.0.title.clone().unwrap_or("Unknown".to_string())
+            );
 
             loop {
                 let current_genre = mpd_library
@@ -104,7 +196,10 @@ fn main() -> Result<()> {
                     .genre
                     .unwrap_or_default();
                 let current_genre_weight = collapse_genres(
-                    &mpd_library.genre_weights.clone().ok_or(anyhow!("while getting genre weights"))?,
+                    &mpd_library
+                        .genre_weights
+                        .clone()
+                        .ok_or(anyhow!("while getting genre weights"))?,
                     current_genre.clone(),
                 );
                 println!("Current genre: {}", current_genre);
@@ -116,12 +211,24 @@ fn main() -> Result<()> {
                         .ok_or(anyhow!("while getting genre weights"))?
                         .iter()
                         .sorted_by(|a, b| euclidean_distance(
-                            &arr1(slice_as_array::<5, f32>(&current_genre_weight).expect("while converting genre weight slice to array")),
-                            &arr1(slice_as_array::<5, f32>(a.1).expect("while converting genre weight slice to array"))
+                            &arr1(
+                                slice_as_array::<5, f32>(&current_genre_weight)
+                                    .expect("while converting genre weight slice to array")
+                            ),
+                            &arr1(
+                                slice_as_array::<5, f32>(a.1)
+                                    .expect("while converting genre weight slice to array")
+                            )
                         )
                         .total_cmp(&euclidean_distance(
-                            &arr1(slice_as_array::<5, f32>(&current_genre_weight).expect("while converting genre weight slice to array")),
-                            &arr1(slice_as_array::<5, f32>(b.1).expect("while converting genre weight slice to array"))
+                            &arr1(
+                                slice_as_array::<5, f32>(&current_genre_weight)
+                                    .expect("while converting genre weight slice to array")
+                            ),
+                            &arr1(
+                                slice_as_array::<5, f32>(b.1)
+                                    .expect("while converting genre weight slice to array")
+                            )
                         )))
                         .map(|(name, _)| name)
                         .take(10)
@@ -146,8 +253,12 @@ fn main() -> Result<()> {
                             }
                             pinned_song = PinnedSong(next_pinned);
                             println!(
-                                "Restarting with new pinned song: {}",
-                                pinned_song.0.title.as_ref().ok_or(anyhow!("while getting pinned song title"))?
+                                "Restarting with new pin: {}",
+                                pinned_song
+                                    .0
+                                    .title
+                                    .as_ref()
+                                    .ok_or(anyhow!("while getting pin title"))?
                             );
                             continue;
                         }
@@ -169,8 +280,12 @@ fn main() -> Result<()> {
                             }
                             pinned_song = PinnedSong(next_pinned);
                             println!(
-                                "Restarting with new pinned song: {}",
-                                pinned_song.0.title.as_ref().ok_or(anyhow!("while getting pinned song title"))?
+                                "Restarting with new pin: {}",
+                                pinned_song
+                                    .0
+                                    .title
+                                    .as_ref()
+                                    .ok_or(anyhow!("while getting pin title"))?
                             );
                             continue;
                         }
@@ -182,13 +297,12 @@ fn main() -> Result<()> {
         Some(Commands::Daemon) => {
             println!("Queueing {} songs and daemonizing...", args.queue_length);
             let config_path = args.config_path;
-            let mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
+            let mut mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
                 Ok(library) => library,
                 Err(e) => match e.downcast::<std::io::Error>() {
                     Ok(inner) => match inner.kind() {
                         std::io::ErrorKind::NotFound => {
-                            let database_path: Option<PathBuf> = None;
-                            MPDLibrary::build(args.base_path.ok_or(anyhow!("--base-path must be used if running `daemon` without an initialized library"))?, config_path, database_path)?
+                            bail!("Must initialize library first using `worf init`")
                         }
                         kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
                     },
@@ -198,15 +312,24 @@ fn main() -> Result<()> {
                 },
             };
 
-            let Ok(Some(current_song)) = mpd_library.mpd_conn.lock().expect("Poisoned lock").currentsong() else {
-                bail!("Start playing a song and try again.");
-            };
+            if args.update_library {
+                mpd_library
+                    .bliss
+                    .update_library(mpd_library.get_all_mpd_songs()?, true, true)
+                    .context("while updating bliss library")?;
+            }
+
+            let current_song = mpd_library.get_current_song()?;
 
             let mut pinned_song = PinnedSong(current_song);
 
             println!(
-                "Queueing from pinned song: {}",
-                pinned_song.0.title.as_ref().ok_or(anyhow!("Failed to get pinned song title"))?
+                "Queueing from pin: {}",
+                pinned_song
+                    .0
+                    .title
+                    .as_ref()
+                    .ok_or(anyhow!("while getting pin title"))?
             );
 
             let sort = |x: &[BlissSong<()>],
@@ -221,7 +344,7 @@ fn main() -> Result<()> {
             //     sample_size: 200,
             //     max_tree_depth: None,
             //     extension_level: 10,
-            // };
+            // }; // this seems to only work right with multiple songs; with only one song as the pin, it always generates the same playlist
 
             loop {
                 match mpd_library.queue_from_song(
@@ -239,14 +362,87 @@ fn main() -> Result<()> {
                         }
                         pinned_song = PinnedSong(next_pinned);
                         println!(
-                            "Restarting with new pinned song: {}",
-                            pinned_song.0.title.as_ref().ok_or(anyhow!("Failed to get pinned song title"))?
+                            "Restarting with new pin: {}",
+                            pinned_song
+                                .0
+                                .title
+                                .as_ref()
+                                .ok_or(anyhow!("while getting pin title"))?
                         );
                         continue;
                     }
                     Err(e) => bail!(e),
                 }
             }
+        }
+        Some(Commands::Server { bind_to }) => {
+            let bind = bind_to.clone().unwrap_or("127.0.0.1:8080".to_string());
+
+            let config_path = args.config_path;
+            let mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
+                Ok(library) => library,
+                Err(e) => match e.downcast::<std::io::Error>() {
+                    Ok(inner) => match inner.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            bail!("Must initialize library first using `worf init`")
+                        }
+                        kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
+                    },
+                    Err(inner_err) => bail!(
+                        "Could not retrieve or create MPDLibrary (failed to downcast MPDLibrary::retrieve error: {inner_err})"
+                    ),
+                },
+            };
+
+            let songs: Vec<_> = mpd_library
+                .bliss
+                .songs_from_library::<()>()?
+                .iter()
+                .map(|song| ClientSong {
+                    path: song.bliss_song.path.clone(),
+                    analysis: song.bliss_song.analysis.as_vec(),
+                })
+                .collect();
+
+            let (address, port) = match bind.split_once(':') {
+                Some(("", port)) => (
+                    "127.0.0.1",
+                    port.parse::<u16>()
+                        .context("while trying to parse server port")?,
+                ),
+                Some((address, "")) => (address, 8080),
+                Some((address, port)) => (
+                    address,
+                    port.parse::<u16>()
+                        .context("while trying to parse server port")?,
+                ),
+                None => {
+                    // no IPv6 but could probably fix that by splitting only on the last `:`
+                    if Ipv4Addr::from_str(&bind).is_ok() {
+                        (bind.as_str(), 8080)
+                    } else {
+                        println!(
+                            "Error parsing server bind address or port, using default 127.0.0.1:8080"
+                        );
+                        ("127.0.0.1", 8080)
+                    }
+                }
+            };
+
+            let figment = Config::figment()
+                .merge(("address", address))
+                .merge(("port", port));
+
+            rocket::custom(figment)
+                .mount("/", FileServer::new(relative!("public"), Options::Index))
+                .mount("/api/", routes![all, info])
+                // .register("/", catchers![not_found])
+                .manage(songs)
+                .launch()
+                .await
+                .context("while starting Rocket server")?;
+
+            Ok(())
         }
         Some(Commands::Init) => {
             println!("Initializing music library and analyzing...");

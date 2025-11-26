@@ -1,0 +1,13 @@
+[Unit]
+Description=Worf
+After=network.target
+
+[Service]
+ExecStart=%h/.cargo/bin/worf daemon
+
+[Install]
+WantedBy=default.target
+
+
+
+
