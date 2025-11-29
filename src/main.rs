@@ -48,8 +48,8 @@ struct Args {
     /// MPD password
     #[arg(short, long)]
     password: Option<String>,
-    #[arg(short, long, default_value_t = true)]
-    /// Whether to update bliss library on `genres`, `daemon`, and `server` commands
+    #[arg(short, long)]
+    /// Pass to update bliss library on `genres`, `daemon`, and `server` commands
     update_library: bool,
     #[arg(short, long)]
     /// Path of genre map JSON file
@@ -67,7 +67,8 @@ enum Commands {
     /// Serve analysis over the network
     Server {
         /// Where to bind the server. Possible formats are `address`, `address:port`, `:port`
-        bind_to: Option<String> },
+        bind_to: Option<String>,
+    },
     /// Update bliss library
     Update,
     /// Initialize (or reinitialize) bliss library
@@ -379,7 +380,7 @@ async fn main() -> Result<()> {
             let bind = bind_to.clone().unwrap_or("127.0.0.1:8080".to_string());
 
             let config_path = args.config_path;
-            let mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
+            let mut mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
                 Ok(library) => library,
                 Err(e) => match e.downcast::<std::io::Error>() {
                     Ok(inner) => match inner.kind() {
@@ -393,6 +394,13 @@ async fn main() -> Result<()> {
                     ),
                 },
             };
+
+            if args.update_library {
+                mpd_library
+                    .bliss
+                    .update_library(mpd_library.get_all_mpd_songs()?, true, true)
+                    .context("while updating bliss library")?;
+            }
 
             let songs: Vec<_> = mpd_library
                 .bliss
