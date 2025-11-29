@@ -10,7 +10,7 @@ repository = "https://github.com/ariririos/worf"
 adler32 = "1.2.0"
 anyhow = "1.0.100"
 bliss-audio = { version = "0.11.2", features = ["library", "ffmpeg"] }
-bliss-audio-aubio-rs = "0.2.4"
+bliss-audio-aubio-sys = { version = "0.2.4", features = ["bindgen"] }
 clap = { version = "4.5.48", features = ["derive"] }
 extended-isolation-forest = "0.2.3"
 fallible-streaming-iterator = "0.1.9"

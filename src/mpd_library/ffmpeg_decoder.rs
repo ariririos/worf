@@ -216,15 +216,16 @@ impl Decoder for FFmpegDecoder {
                 }
             }
         }
+        let audio_stream = ictx.streams().best(media::Type::Audio).ok_or_else(|| {
+            BlissError::DecodingError(format!(
+                "No audio stream found for file '{}'.",
+                path.display()
+            ))
+        })?;
         let context_or_stream = if ictx.metadata().iter().count() != 0 {
             ContextOrStream::Context(&ictx)
         } else {
-            ContextOrStream::Stream(&ictx.streams().best(media::Type::Audio).ok_or_else(|| {
-                BlissError::DecodingError(format!(
-                    "No audio stream found for file '{}'.",
-                    path.display()
-                ))
-            })?)
+            ContextOrStream::Stream(&audio_stream)
         };
         if let Some(title) = context_or_stream.metadata().get("title") {
             song.title = match title {

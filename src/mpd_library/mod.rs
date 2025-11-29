@@ -16,7 +16,10 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+#[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
