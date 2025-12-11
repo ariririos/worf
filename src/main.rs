@@ -137,25 +137,12 @@ struct PinnedSong(MPDSong);
 #[rocket::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let config_path = args.config_path;
 
     match &args.command {
         Some(Commands::Genres) => {
             println!("Queueing {} songs and daemonizing...", args.queue_length);
-            let config_path = args.config_path;
-            let mut mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
-                Ok(library) => library,
-                Err(e) => match e.downcast::<std::io::Error>() {
-                    Ok(inner) => match inner.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            bail!("Must initialize library first using `worf init`")
-                        }
-                        kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
-                    },
-                    Err(inner_err) => bail!(
-                        "Could not retrieve or create MPDLibrary (failed to downcast MPDLibrary::retrieve error: {inner_err})"
-                    ),
-                },
-            };
+            let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
             let track_weights = mpd_library.get_track_genre_weights(args.genres_path)?;
 
             let genre_sort = |x: &[BlissSong<()>],
@@ -239,79 +226,29 @@ async fn main() -> Result<()> {
                 // TODO: once #![feature(closure_lifetime_binder)] is stable, combine these if/else branches
                 if current_genre.is_empty() {
                     println!("No genre available, defaulting to bliss analysis queueing...");
-                    match mpd_library.queue_from_song(
+                    pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
                         10,
                         &euclidean_distance,
                         bliss_sort,
                         true,
                         false,
-                    ) {
-                        Ok(next_pinned) => {
-                            if next_pinned == pinned_song.0 {
-                                println!("You made it to the end of your music library!");
-                                return Ok(());
-                            }
-                            pinned_song = PinnedSong(next_pinned);
-                            println!(
-                                "Restarting with new pin: {}",
-                                pinned_song
-                                    .0
-                                    .title
-                                    .as_ref()
-                                    .ok_or(anyhow!("while getting pin title"))?
-                            );
-                            continue;
-                        }
-                        Err(e) => bail!(e),
-                    }
+                    )?)
                 } else {
-                    match mpd_library.queue_from_song(
+                    pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
                         10,
                         &euclidean_distance,
                         genre_sort,
                         true,
                         false,
-                    ) {
-                        Ok(next_pinned) => {
-                            if next_pinned == pinned_song.0 {
-                                println!("You made it to the end of your music library!");
-                                return Ok(());
-                            }
-                            pinned_song = PinnedSong(next_pinned);
-                            println!(
-                                "Restarting with new pin: {}",
-                                pinned_song
-                                    .0
-                                    .title
-                                    .as_ref()
-                                    .ok_or(anyhow!("while getting pin title"))?
-                            );
-                            continue;
-                        }
-                        Err(e) => bail!(e),
-                    }
+                    )?)
                 }
             }
         }
         Some(Commands::Daemon) => {
             println!("Queueing {} songs and daemonizing...", args.queue_length);
-            let config_path = args.config_path;
-            let mut mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
-                Ok(library) => library,
-                Err(e) => match e.downcast::<std::io::Error>() {
-                    Ok(inner) => match inner.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            bail!("Must initialize library first using `worf init`")
-                        }
-                        kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
-                    },
-                    Err(inner_err) => bail!(
-                        "Could not retrieve or create MPDLibrary (failed to downcast MPDLibrary::retrieve error: {inner_err})"
-                    ),
-                },
-            };
+            let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
 
             if args.update_library {
                 mpd_library
@@ -348,52 +285,20 @@ async fn main() -> Result<()> {
             // }; // this seems to only work right with multiple songs; with only one song as the pin, it always generates the same playlist
 
             loop {
-                match mpd_library.queue_from_song(
+                pinned_song = PinnedSong(mpd_library.queue_from_song(
                     &pinned_song.0,
                     10,
                     &euclidean_distance,
                     &sort,
                     true,
                     false,
-                ) {
-                    Ok(next_pinned) => {
-                        if next_pinned == pinned_song.0 {
-                            println!("You made it to the end of your music library!");
-                            return Ok(());
-                        }
-                        pinned_song = PinnedSong(next_pinned);
-                        println!(
-                            "Restarting with new pin: {}",
-                            pinned_song
-                                .0
-                                .title
-                                .as_ref()
-                                .ok_or(anyhow!("while getting pin title"))?
-                        );
-                        continue;
-                    }
-                    Err(e) => bail!(e),
-                }
+                )?)
             }
         }
         Some(Commands::Server { bind_to }) => {
             let bind = bind_to.clone().unwrap_or("127.0.0.1:8080".to_string());
 
-            let config_path = args.config_path;
-            let mut mpd_library = match MPDLibrary::retrieve(config_path.clone()) {
-                Ok(library) => library,
-                Err(e) => match e.downcast::<std::io::Error>() {
-                    Ok(inner) => match inner.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            bail!("Must initialize library first using `worf init`")
-                        }
-                        kind => bail!("Could not retrieve or create MPDLibrary, io error: {kind}"),
-                    },
-                    Err(inner_err) => bail!(
-                        "Could not retrieve or create MPDLibrary (failed to downcast MPDLibrary::retrieve error: {inner_err})"
-                    ),
-                },
-            };
+            let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
 
             if args.update_library {
                 mpd_library
@@ -454,7 +359,6 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Init) => {
             println!("Initializing music library and analyzing...");
-            let config_path = args.config_path;
             let database_path = args.database_path;
             let Some(mpd_base_path) = args.base_path else {
                 bail!("--base-path must be used if running `init`");
@@ -464,7 +368,6 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Update) => {
             println!("Updating music library analysis...");
-            let config_path = args.config_path;
             let mut mpd_library = MPDLibrary::retrieve(config_path)?;
             mpd_library
                 .bliss
