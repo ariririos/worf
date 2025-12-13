@@ -1,4 +1,4 @@
-// Worf 0.0.1
+// Worf
 // * Copyright (c) 2025 Ari Rios <me@aririos.com>
 // * License-SPDX: GPL-3.0-only
 // * Based on Polochon-street/blissify-rs
@@ -29,6 +29,8 @@ use serde::Serialize;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+const NUM_GENRE_FEATURES: usize = 5;
 
 #[derive(Parser, Debug)]
 #[command(name = "Worf", version, about, long_about = None)]
@@ -143,7 +145,8 @@ async fn main() -> Result<()> {
         Some(Commands::Genres) => {
             println!("Queueing {} songs and daemonizing...", args.queue_length);
             let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
-            let track_weights = mpd_library.get_track_genre_weights(args.genres_path)?;
+            let track_weights =
+                mpd_library.get_track_genre_weights::<NUM_GENRE_FEATURES>(args.genres_path)?;
 
             let genre_sort = |x: &[BlissSong<()>],
                               y: &[BlissSong<()>],
@@ -183,7 +186,7 @@ async fn main() -> Result<()> {
                     .bliss_song
                     .genre
                     .unwrap_or_default();
-                let current_genre_weight = collapse_genres(
+                let current_genre_weight = collapse_genres::<NUM_GENRE_FEATURES>(
                     &mpd_library
                         .genre_weights
                         .clone()

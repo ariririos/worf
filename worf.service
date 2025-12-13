@@ -1,6 +1,7 @@
 [Unit]
 Description=Worf
 After=network.target
+Requires=mpd.service
 
 [Service]
 ExecStart=%h/.cargo/bin/worf daemon

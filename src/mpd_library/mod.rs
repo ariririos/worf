@@ -106,11 +106,11 @@ fn vec_avg<const N: usize>(v: Vec<Vec<f32>>) -> Vec<f32> {
         .collect()
 }
 
-pub fn collapse_genres(genre_weights: &GenreWeights, genres: String) -> Vec<f32> {
+pub fn collapse_genres<const N: usize>(genre_weights: &GenreWeights, genres: String) -> Vec<f32> {
     if genres.is_empty() {
-        vec![0.0; 5]
+        vec![0.0; N]
     } else {
-        vec_avg::<5>(
+        vec_avg::<N>(
             genres
                 .split(",")
                 .filter_map(|genre| genre_weights.get(genre))
@@ -165,10 +165,13 @@ pub const fn slice_as_array<const N: usize, T>(v: &[T]) -> Option<&[T; N]> {
     }
 }
 
+/// A mapping of genre names to a 5-tuple of weights along the axes from everynoise.com: (organicness/mechanicity, etherealness/spikiness, energy, dynamic variation, instrumentalness). (see https://www.furia.com/page.cgi?type=log&id=419 for the last three values). The 5-tuple is a Vec for now until variadics make it into the language, because I want to keep support for genre weights with different numbers of features.
 pub type GenreWeights = HashMap<String, Vec<f32>>;
+
+/// A mapping of track names to calculated genre weights from a Eucliean average of their genre names. Might make sense to customize the averaging function in the future.
 type TrackWeights = HashMap<String, Vec<f32>>;
 
-/// The main struct which holds the [bliss_audio::library::Library] and [mpd::Client]. Also holds the genre weightings ([GenreWeights]) if present.
+/// The main struct which holds the [bliss_audio::library::Library] and [mpd::Client]. Also holds the [GenreWeights] if present.
 pub struct MPDLibrary {
     pub bliss: Library<Config, Decoder>,
     pub mpd_conn: Arc<Mutex<Client<MPDStream>>>,
@@ -611,7 +614,7 @@ impl MPDLibrary {
 
     /// Loads genre weights from disk and associates them with tracks in the bliss library. May fail if the weights are not found,
     /// if they're in the wrong format, or if the bliss library is corrupted.
-    pub fn get_track_genre_weights(
+    pub fn get_track_genre_weights<const N: usize>(
         &mut self,
         genres_path: Option<PathBuf>,
     ) -> Result<TrackWeights> {
@@ -641,7 +644,7 @@ impl MPDLibrary {
                             )))?
                             .to_owned(),
                     )
-                    .or_insert(collapse_genres(&genre_weights, genres));
+                    .or_insert(collapse_genres::<N>(&genre_weights, genres));
             }
         }
         Ok(genre_weights_by_track_path)
