@@ -35,9 +35,6 @@ const NUM_GENRE_FEATURES: usize = 5;
 #[derive(Parser, Debug)]
 #[command(name = "Worf", version, about, long_about = None)]
 struct Args {
-    /// How many songs to queue up
-    #[arg(long, default_value_t = 10)]
-    queue_length: u8,
     /// MPD base path
     #[arg(short, long)]
     base_path: Option<PathBuf>,
@@ -143,7 +140,7 @@ async fn main() -> Result<()> {
 
     match &args.command {
         Some(Commands::Genres) => {
-            println!("Queueing {} songs and daemonizing...", args.queue_length);
+            println!("Queueing songs in background...");
             let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
             let track_weights =
                 mpd_library.get_track_genre_weights::<NUM_GENRE_FEATURES>(args.genres_path)?;
@@ -231,7 +228,6 @@ async fn main() -> Result<()> {
                     println!("No genre available, defaulting to bliss analysis queueing...");
                     pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
-                        // 10,
                         &euclidean_distance,
                         bliss_sort,
                         true,
@@ -240,7 +236,6 @@ async fn main() -> Result<()> {
                 } else {
                     pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
-                        // 10,
                         &euclidean_distance,
                         genre_sort,
                         true,
@@ -250,7 +245,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Daemon) => {
-            println!("Queueing {} songs and daemonizing...", args.queue_length);
+            println!("Queueing songs in background...");
             let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
 
             if args.update_library {
@@ -290,7 +285,6 @@ async fn main() -> Result<()> {
             loop {
                 pinned_song = PinnedSong(mpd_library.queue_from_song(
                     &pinned_song.0,
-                    // 10,
                     &euclidean_distance,
                     &sort,
                     true,
