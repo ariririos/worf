@@ -1,18 +1,16 @@
 [package]
 name = "worf"
 description = "Automatically queue similar songs in MPD, remembering the original song."
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/ariririos/worf"
 
 [dependencies]
-adler32 = "1.2.0"
 anyhow = "1.0.100"
 bliss-audio = { version = "0.11.2", features = ["library", "ffmpeg"] }
 bliss-audio-aubio-sys = { version = "0.2.4", features = ["bindgen"] }
 clap = { version = "4.5.48", features = ["derive"] }
-extended-isolation-forest = "0.2.3"
 fallible-streaming-iterator = "0.1.9"
 ffmpeg-next = { version = "8.0.0" }
 ffmpeg-sys-next = { version = "8.0.1" }
@@ -21,10 +19,6 @@ log = "0.4.28"
 mpd = "0.1.0"
 ndarray = "0.16.1"
 noisy_float = "0.2.0"
-num-traits = "0.2.19"
-pretty_assertions = "1.4.1"
 rocket = { version = "0.5.1", features = ["json"] }
-rubato = "0.16.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-thiserror = "2.0.17"
