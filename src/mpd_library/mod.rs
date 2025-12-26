@@ -8,6 +8,7 @@ use bliss_audio::{
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use ffmpeg_decoder::FFmpegDecoder as Decoder;
+use itertools::Itertools;
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use ndarray::{Array1, arr1};
 use noisy_float::prelude::n32;
@@ -430,13 +431,14 @@ impl MPDLibrary {
     }
 
     /// Continuously queues songs from the MPD library based on similarity to the song passed as
-    /// argument until it reaches the end of the user's library. The distance metric can be customized, as well as
-    /// the sort function. May fail if the database connection is dropped, if bliss fails to create a playlist, or
-    /// if the song passed in has not been analyzed.
+    /// argument until it reaches the end of the user's library. The distance metric can be customized,
+    /// as well as the sort function. Use the `keep_queue` argument to set the pin whenever a new song(s)
+    /// is queued, but don't immediately overwrite the queue -- useful for queueing playlists and
+    /// generating recommendations at the end. May fail if the database connection is dropped, if bliss
+    /// fails to create a playlist, or if the song passed in has not been analyzed.
     pub fn queue_from_song<'a, F, I>(
         &self,
         song: &MPDSong,
-        num_songs: usize,
         distance: &'a dyn DistanceMetricBuilder,
         sort_by: F,
         dedup: bool,
@@ -454,14 +456,9 @@ impl MPDLibrary {
             .context("while building bliss playlist")?
             .skip(1);
 
-        let mut last_status = mpd_conn.status().context("while getting MPD status")?;
-        // let mut last_version = mpd_conn
-        //     .status()
-        //     .context("while getting MPD status")?
-        //     .queue_version;
         let current_pos = song
             .place
-            .ok_or(anyhow!("Failed to get current song position initial"))?
+            .ok_or(anyhow!("while getting initial current song position"))?
             .pos;
         if !keep_queue {
             mpd_conn
@@ -474,142 +471,113 @@ impl MPDLibrary {
             }
         }
 
-        let mut songs_added: Vec<BlissSong<()>> = Vec::new();
+        let mut songs_added: Vec<String> = vec![];
 
-        // TODO: instead of adding songs immediately when this function is called, need to instead keep the pin around but don't start queueing anything until the user hits the last song in their queue. this also makes it easier to auto switch to ForestDistance when multiple songs are in the queue or based on a flag
-
-        for _ in 0..num_songs {
-            let next_song = playlist.next();
-            let mut mpd_song = self
-                .bliss_song_to_mpd(
-                    next_song
-                        .as_ref()
-                        .ok_or(anyhow!("while getting next song from bliss"))?,
-                )
-                .context("while converting bliss path to MPD path")?;
-            songs_added.push(
+        let next_song = playlist.next();
+        let mut mpd_song = self
+            .bliss_song_to_mpd(
                 next_song
-                    .clone()
-                    .ok_or(anyhow!("while storing next song"))?,
+                    .as_ref()
+                    .ok_or(anyhow!("while getting next song from bliss"))?,
+            )
+            .context("while converting bliss path to MPD path")?;
+        songs_added.push(mpd_song.file.clone());
+        let title = mpd_song.title.take();
+        let result = mpd_conn.push(mpd_song);
+        if let Err(e) = result {
+            println!(
+                "Error while pushing song {} to MPD queue, skipping: {e}",
+                title.unwrap_or("Unknown".to_string())
             );
-            let title = mpd_song.title.take();
-            let result = mpd_conn.push(mpd_song);
-            if let Err(e) = result {
-                println!(
-                    "Error while pushing song {} to MPD queue, skipping: {e}",
-                    title.unwrap_or("Unknown".to_string())
-                );
-            }
         }
 
-        for bliss_song in playlist {
+        let mut last_queue = mpd_conn.queue()?;
+
+        loop {
             let next_event = mpd_conn
                 .wait(&[mpd::Subsystem::Queue])
                 .context("while waiting on events from MPD")?;
 
             if next_event.len() > 0 && next_event[0] == mpd::Subsystem::Queue {
-                let mut new_status = mpd_conn.status().context("while getting MPD status")?;
-                let last_song = loop {
-                    if let Some(status) = last_status.song {
-                        break status;
-                    } else {
-                        println!("Waiting for previous song...");
-                        let next_event = mpd_conn
-                            .wait(&[mpd::Subsystem::Queue])
-                            .context("while waiting on events from MPD")?;
-                        if next_event.len() > 0 && next_event[0] == mpd::Subsystem::Queue {
-                            println!("Got it!");
-                            continue;
-                        }
+                let status = mpd_conn.status()?;
+                let new_queue = mpd_conn.queue()?;
+                if new_queue.len() != last_queue.len() {
+                    // don't restart if the new queue is the old queue plus any of the songs from the generated playlist, otherwise use the currently playing song as the new pin
+                    let last_queue_songs: Vec<&MPDSong> = last_queue.iter().collect();
+                    let all_songs_same_or_generated = new_queue.iter().all(|song| {
+                        last_queue_songs.contains(&song) || songs_added.contains(&song.file)
+                    });
+                    if !all_songs_same_or_generated {
+                        let new_pin = mpd_conn
+                            .currentsong()
+                            .context("while getting current song from MPD")?
+                            .ok_or(anyhow!("while getting current song from MPD"))?;
+                        println!(
+                            "Restarting with new pin: {}",
+                            new_pin
+                                .title
+                                .as_ref()
+                                .ok_or(anyhow!("while getting pin title"))?
+                        );
+                        return Ok(new_pin);
                     }
-                };
-                let new_song = loop {
-                    if let Some(status) = new_status.song {
-                        last_status = new_status.clone();
-                        break status;
-                    } else {
-                        println!("Waiting for next song...");
-                        mpd_conn
-                            .wait(&[mpd::Subsystem::Queue])
-                            .context("while waiting on events from MPD")?;
-                        new_status = mpd_conn.status().context("while getting MPD status")?;
-                        println!("Got it!");
-                        continue;
+                } else {
+                    // don't restart if new queue is just a reshuffling of the old queue, but do restart if any songs are different. assume the now playing song is the new pin
+                    let new_queue_sorted = new_queue
+                        .iter()
+                        .sorted_by(|a, b| Ord::cmp(&a.file, &b.file));
+                    let last_queue_sorted = last_queue
+                        .iter()
+                        .sorted_by(|a, b| Ord::cmp(&a.file, &b.file));
+                    let all_songs_same = new_queue_sorted
+                        .zip(last_queue_sorted)
+                        .all(|(new, old)| new.file == old.file);
+                    if !all_songs_same {
+                        let new_pin = mpd_conn
+                            .currentsong()
+                            .context("while getting current song from MPD")?
+                            .ok_or(anyhow!("while getting current song from MPD"))?;
+                        println!(
+                            "Restarting with new pin: {}",
+                            new_pin
+                                .title
+                                .as_ref()
+                                .ok_or(anyhow!("while getting pin title"))?
+                        );
+                        return Ok(new_pin);
                     }
-                };
-                // if new_status.queue_version != last_version {
-                //     println!("new version");
-                //     let changes = mpd_conn.changes(last_version)?;
-                //     if changes.len() == 1
-                //         && let Some(changed_song) = changes.get(0)
-                //     {
-                //         println!("one change");
-                //         let current_song = mpd_conn
-                //             .currentsong()?
-                //             .ok_or(anyhow!("while getting current song"))?;
-                //         // we continued to another song already in the queue, no actual changes
-                //         if changed_song.file == current_song.file {
-                //             if new_status.nextsong.is_none() {
-                //                 let mpd_song = self
-                //                     .bliss_song_to_mpd(&bliss_song)
-                //                     .context("while converting bliss path to MPD path")?;
-                //                 mpd_conn
-                //                     .push(mpd_song)
-                //                     .context("while pushing songs to MPD queue")?;
-                //                 songs_added.push(bliss_song);
-                //             }
-                //             last_version = new_status.queue_version;
-                //             continue;
-                //         }
-                //         // otherwise we changed the queue some other way
-                //         return Ok(mpd_conn
-                //             .currentsong()
-                //             .context("while getting current song from MPD")?
-                //             .ok_or(anyhow!("while getting current song from MPD"))?);
-                //     }
-                //     println!("other changes");
-                //     // return Ok(mpd_conn
-                //     //     .currentsong()
-                //     //     .context("while getting current song from MPD")?
-                //     //     .ok_or(anyhow!("while getting current song from MPD"))?);
-                // }
-                // FIXME: need a check to be sure that all songs in the new status are either (from previous status) || (part of the generated playlist)
-                // if there's a difference and it's the currently playing song, then restart with a new pin
-                // if it's not the currently playing song, print a warning about other queueing daemons
-                // if it's several new songs, restart with a new pin but don't start queueing until the end of the newly added songs
-                // and eventually switch to using ForestDistance
-                if new_status.nextsong.is_none() {
-                    let mpd_song = self
-                        .bliss_song_to_mpd(&bliss_song)
-                        .context("while converting bliss path to MPD path")?;
-                    mpd_conn
-                        .push(mpd_song)
-                        .context("while pushing songs to MPD queue")?;
-                    // last_version = new_status.queue_version;
-                } else if new_song.id == last_song.id || new_song.pos == last_song.pos + 1 {
-                    continue;
                 }
-                // } else if new_status.queue_version != last_status.queue_version {
-                //     println!("queue version updated");
-                // }
-                else if last_status.state == mpd::status::State::Play {
-                    let new_pin = mpd_conn
-                        .currentsong()
-                        .context("while getting current song from MPD")?
-                        .ok_or(anyhow!("while getting current song from MPD"))?;
-                    println!(
-                        "Restarting with new pin: {}",
-                        new_pin
-                            .title
-                            .as_ref()
-                            .ok_or(anyhow!("while getting pin title"))?
-                    );
-                    return Ok(new_pin);
+
+                let queue_pos = status
+                    .song
+                    .ok_or(anyhow!("while getting current song queue position"))?
+                    .pos;
+
+                last_queue = new_queue;
+
+                if (status.queue_len > 1 && queue_pos >= status.queue_len - 1)
+                    || status.queue_len <= 1
+                {
+                    let next_song = playlist.next();
+                    let mut mpd_song = self
+                        .bliss_song_to_mpd(
+                            next_song
+                                .as_ref()
+                                .ok_or(anyhow!("while getting next song from bliss"))?,
+                        )
+                        .context("while converting bliss path to MPD path")?;
+                    songs_added.push(mpd_song.file.clone());
+                    let title = mpd_song.title.take();
+                    let result = mpd_conn.push(mpd_song);
+                    if let Err(e) = result {
+                        println!(
+                            "Error while pushing song {} to MPD queue, skipping: {e}",
+                            title.unwrap_or("Unknown".to_string())
+                        );
+                    }
                 }
             }
         }
-
-        Ok(song.clone())
     }
 
     /// Loads genre weights from disk and associates them with tracks in the bliss library. May fail if the weights are not found,
@@ -625,9 +593,9 @@ impl MPDLibrary {
 
         let genre_weights: GenreWeights = serde_json::from_reader(
             File::open(genres_path.unwrap_or("./genres.json".into()))
-                .context("while opening genres.json")?,
+                .context("while opening genre weights json")?,
         )
-        .context("while parsing genres.json")?;
+        .context("while parsing genre weights json")?;
         self.genre_weights = Some(genre_weights.clone());
 
         let mut genre_weights_by_track_path: TrackWeights = HashMap::new();

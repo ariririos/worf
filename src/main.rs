@@ -231,20 +231,20 @@ async fn main() -> Result<()> {
                     println!("No genre available, defaulting to bliss analysis queueing...");
                     pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
-                        10,
+                        // 10,
                         &euclidean_distance,
                         bliss_sort,
                         true,
-                        false,
+                        true,
                     )?)
                 } else {
                     pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
-                        10,
+                        // 10,
                         &euclidean_distance,
                         genre_sort,
                         true,
-                        false,
+                        true,
                     )?)
                 }
             }
@@ -290,11 +290,11 @@ async fn main() -> Result<()> {
             loop {
                 pinned_song = PinnedSong(mpd_library.queue_from_song(
                     &pinned_song.0,
-                    10,
+                    // 10,
                     &euclidean_distance,
                     &sort,
                     true,
-                    false,
+                    true,
                 )?)
             }
         }
