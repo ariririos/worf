@@ -14,18 +14,21 @@
 mod mpd_library;
 
 use anyhow::{Context, Result, anyhow, bail};
+use bliss_audio::Song as BareBlissSong;
 use bliss_audio::library::LibrarySong as BlissSong;
 use bliss_audio::playlist::{closest_to_songs, euclidean_distance};
 use clap::{Parser, Subcommand};
-// use extended_isolation_forest::ForestOptions;
 use itertools::Itertools;
 use mpd::Song as MPDSong;
 use mpd_library::{MPDLibrary, closest_to_genre_songs, collapse_genres, slice_as_array};
 use ndarray::arr1;
 use rocket::Config;
 use rocket::fs::{FileServer, Options, relative};
+use rocket::response::status::{BadRequest, NotFound};
 use rocket::{State, get, http::Status, routes, serde::json::Json};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -74,61 +77,150 @@ enum Commands {
     Init,
 }
 
-// #[get("/<artist>/<album>/<song>")]
-// fn analysis(artist: &str, album: &str, song: &str, state: &State<MPDLibrary>) -> std::result::Result<Json<Vec<f32>>, NotFound<String>> {
-//     let path = PathBuf::new();
-//     let path = path.join(state.mpd_base_path.clone()).join(artist).join(album).join(song);
-//     println!("path: {}", path.display());
-//     Ok(Json(state.bliss.song_from_path::<()>(path.to_str().context("Path should have been Unicode").map_err(|e| NotFound(e.to_string()))?).context("Song does not exist in bliss database").map_err(|e| NotFound(e.to_string()))?.bliss_song.analysis.as_vec()))
-// }
-
-#[derive(Serialize, Clone)]
-struct ClientSong {
-    path: PathBuf,
-    analysis: Vec<f32>,
-}
+const CHUNK_SIZE: usize = 50;
 
 #[derive(Serialize)]
 struct AllSongsPage {
-    page: u32,
-    songs: Vec<ClientSong>,
+    page: usize,
+    songs: Vec<(PathBuf, Vec<f32>)>,
 }
 
-const CHUNK_SIZE: u32 = 50;
+struct ClientLibrary {
+    songs: ChunkedReadOnlyHashMap<PathBuf, Vec<f32>>,
+    mpd_library: MPDLibrary,
+}
+
+#[derive(Serialize)]
+struct ChunkedReadOnlyHashMap<K, V> {
+    chunks: Vec<HashMap<K, V>>,
+    total_len: usize,
+}
+
+impl<K: Hash + Eq + Clone + Ord, V: Clone> ChunkedReadOnlyHashMap<K, V> {
+    pub fn new(base: HashMap<K, V>, chunk_size: usize) -> Self {
+        let total_len = base.len();
+        let num_chunks = total_len / chunk_size + 1;
+        let chunked_entries = base
+            .into_iter()
+            .sorted_by_key(|x| x.0.clone())
+            .chunks(chunk_size);
+        let chunks: Vec<HashMap<K, V>> = (&chunked_entries)
+            .into_iter()
+            .map(|chunk| HashMap::from_iter(chunk))
+            .collect();
+        assert!(num_chunks == chunks.len());
+        Self { chunks, total_len }
+    }
+
+    pub fn get_chunk_index(&self, key: &K) -> Option<usize> {
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            if chunk.contains_key(key) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn get(&self, key: K) -> Option<V> {
+        let idx = self.get_chunk_index(&key)?;
+        self.chunks[idx].get(&key).cloned()
+    }
+
+    pub fn get_chunk_at_index(&self, idx: usize) -> Option<&HashMap<K, V>> {
+        if idx < self.chunks.len() {
+            return Some(&self.chunks[idx]);
+        }
+        None
+    }
+}
 
 #[get("/all/<page>")]
 fn all(
-    page: u32,
-    state: &State<Vec<ClientSong>>,
+    page: usize,
+    state: &State<ClientLibrary>,
 ) -> std::result::Result<Json<AllSongsPage>, Status> {
-    if page > (state.len() as f32 / CHUNK_SIZE as f32).floor() as u32 {
+    if page >= state.songs.chunks.len() as usize {
         return Err(Status::BadRequest);
     }
-    let start_idx = (CHUNK_SIZE * page) as usize;
-    let end_idx = (CHUNK_SIZE * (page + 1)) as usize;
-    let songs_page = if start_idx > state.len() - 1 && end_idx > state.len() - 1 {
-        return Err(Status::InternalServerError);
-    } else if end_idx > state.len() - 1 {
-        state[start_idx..].to_vec()
-    } else {
-        state[start_idx..end_idx].to_vec()
-    };
     Ok(Json(AllSongsPage {
         page,
-        songs: songs_page,
+        songs: state
+            .songs
+            .get_chunk_at_index(page)
+            .ok_or(Status::InternalServerError)?
+            .iter()
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect(),
     }))
 }
 
 #[derive(Serialize)]
 struct Info {
-    max_page: u32,
+    max_page: usize,
 }
 
 #[get("/info")]
-fn info(state: &State<Vec<ClientSong>>) -> Json<Info> {
+fn info(state: &State<ClientLibrary>) -> Json<Info> {
     Json(Info {
-        max_page: (state.len() as f32 / CHUNK_SIZE as f32).floor() as u32,
+        max_page: state.songs.chunks.len() - 1,
     })
+}
+
+#[get("/analysis/<path>")]
+fn analysis(
+    path: &str,
+    state: &State<ClientLibrary>,
+) -> std::result::Result<Json<Vec<f32>>, NotFound<String>> {
+    Ok(Json(
+        state
+            .songs
+            .get(path.into())
+            .context("Song does not exist in bliss database")
+            .map_err(|e| NotFound(e.to_string()))?,
+    ))
+}
+
+#[derive(Serialize)]
+struct ClientPlaylist {
+    head: BareBlissSong,
+    tail: Vec<BareBlissSong>,
+}
+
+#[get("/playlist/<path>?<length>")]
+fn playlist(
+    path: &str,
+    length: usize,
+    state: &State<ClientLibrary>,
+) -> std::result::Result<Json<ClientPlaylist>, BadRequest<String>> {
+    let bliss_sort =
+        |x: &[BlissSong<()>], y: &[BlissSong<()>], z| -> Box<dyn Iterator<Item = BlissSong<()>>> {
+            Box::new(closest_to_songs(x, y, z))
+        };
+    let full_song_path = PathBuf::new();
+    let full_song_path = full_song_path
+        .join(state.mpd_library.bliss.config.mpd_base_path.clone())
+        .join(path);
+    let playlist: Vec<BareBlissSong> = state
+        .mpd_library
+        .bliss
+        .playlist_from_custom(
+            &[full_song_path
+                .to_str()
+                .ok_or(BadRequest("Couldn't convert path to full path".into()))?],
+            &euclidean_distance,
+            bliss_sort,
+            true,
+        )
+        .context("while building bliss playlist")
+        .map_err(|e| BadRequest(e.to_string()))?
+        .take(length)
+        .map(|library_song| library_song.bliss_song)
+        .collect();
+
+    Ok(Json(ClientPlaylist {
+        head: playlist[0].clone(),
+        tail: playlist[1..].to_vec(),
+    }))
 }
 
 struct PinnedSong(MPDSong);
@@ -137,6 +229,11 @@ struct PinnedSong(MPDSong);
 async fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config_path;
+
+    let bliss_sort =
+        |x: &[BlissSong<()>], y: &[BlissSong<()>], z| -> Box<dyn Iterator<Item = BlissSong<()>>> {
+            Box::new(closest_to_songs(x, y, z))
+        };
 
     match &args.command {
         Some(Commands::Genres) => {
@@ -150,13 +247,6 @@ async fn main() -> Result<()> {
                               z|
              -> Box<dyn Iterator<Item = BlissSong<()>>> {
                 Box::new(closest_to_genre_songs(x, y, z, &track_weights))
-            };
-
-            let bliss_sort = |x: &[BlissSong<()>],
-                              y: &[BlissSong<()>],
-                              z|
-             -> Box<dyn Iterator<Item = BlissSong<()>>> {
-                Box::new(closest_to_songs(x, y, z))
             };
 
             if args.update_library {
@@ -268,13 +358,6 @@ async fn main() -> Result<()> {
                     .ok_or(anyhow!("while getting pin title"))?
             );
 
-            let sort = |x: &[BlissSong<()>],
-                        y: &[BlissSong<()>],
-                        z|
-             -> Box<dyn Iterator<Item = BlissSong<()>>> {
-                Box::new(closest_to_songs(x, y, z))
-            };
-
             // let forest_distance: &dyn DistanceMetricBuilder = &ForestOptions {
             //     n_trees: 1000,
             //     sample_size: 200,
@@ -286,7 +369,7 @@ async fn main() -> Result<()> {
                 pinned_song = PinnedSong(mpd_library.queue_from_song(
                     &pinned_song.0,
                     &euclidean_distance,
-                    &sort,
+                    bliss_sort,
                     true,
                     true,
                 )?)
@@ -304,15 +387,27 @@ async fn main() -> Result<()> {
                     .context("while updating bliss library")?;
             }
 
-            let songs: Vec<_> = mpd_library
+            let songs: HashMap<PathBuf, Vec<f32>> = mpd_library
                 .bliss
                 .songs_from_library::<()>()?
                 .iter()
-                .map(|song| ClientSong {
-                    path: song.bliss_song.path.clone(),
-                    analysis: song.bliss_song.analysis.as_vec(),
+                .map(|song| {
+                    (
+                        song.bliss_song
+                            .path
+                            .strip_prefix(mpd_library.bliss.config.mpd_base_path.to_path_buf())
+                            .context("while stripping MPD base path from song path")
+                            .unwrap()
+                            .to_path_buf(),
+                        song.bliss_song.analysis.as_vec(),
+                    )
                 })
                 .collect();
+
+            let library_interface = ClientLibrary {
+                songs: ChunkedReadOnlyHashMap::new(songs, CHUNK_SIZE),
+                mpd_library,
+            };
 
             let (address, port) = match bind.split_once(':') {
                 Some(("", port)) => (
@@ -345,9 +440,9 @@ async fn main() -> Result<()> {
 
             rocket::custom(figment)
                 .mount("/", FileServer::new(relative!("public"), Options::Index))
-                .mount("/api/", routes![all, info])
+                .mount("/api/", routes![all, info, analysis, playlist])
                 // .register("/", catchers![not_found])
-                .manage(songs)
+                .manage(library_interface)
                 .launch()
                 .await
                 .context("while starting Rocket server")?;

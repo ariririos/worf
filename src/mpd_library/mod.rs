@@ -65,7 +65,7 @@ impl Write for MPDStream {
 pub struct Config {
     #[serde(flatten)]
     base_config: BaseConfig,
-    mpd_base_path: PathBuf,
+    pub mpd_base_path: PathBuf,
 }
 
 impl AppConfigTrait for Config {
