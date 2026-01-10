@@ -12,9 +12,9 @@
 // - Ultimately, the idea of keeping state about the "pin" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
 
 mod mpd_library;
+mod server;
 
 use anyhow::{Context, Result, anyhow, bail};
-use bliss_audio::Song as BareBlissSong;
 use bliss_audio::library::LibrarySong as BlissSong;
 use bliss_audio::playlist::{closest_to_songs, euclidean_distance};
 use clap::{Parser, Subcommand};
@@ -24,11 +24,9 @@ use mpd_library::{MPDLibrary, closest_to_genre_songs, collapse_genres, slice_as_
 use ndarray::arr1;
 use rocket::Config;
 use rocket::fs::{FileServer, Options, relative};
-use rocket::response::status::{BadRequest, NotFound};
-use rocket::{State, get, http::Status, routes, serde::json::Json};
-use serde::Serialize;
+use rocket::routes;
+use server::{CHUNK_SIZE, ChunkedReadOnlyHashMap, ClientLibrary, all, analysis, info, playlist};
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -75,152 +73,6 @@ enum Commands {
     Update,
     /// Initialize (or reinitialize) bliss library
     Init,
-}
-
-const CHUNK_SIZE: usize = 50;
-
-#[derive(Serialize)]
-struct AllSongsPage {
-    page: usize,
-    songs: Vec<(PathBuf, Vec<f32>)>,
-}
-
-struct ClientLibrary {
-    songs: ChunkedReadOnlyHashMap<PathBuf, Vec<f32>>,
-    mpd_library: MPDLibrary,
-}
-
-#[derive(Serialize)]
-struct ChunkedReadOnlyHashMap<K, V> {
-    chunks: Vec<HashMap<K, V>>,
-    total_len: usize,
-}
-
-impl<K: Hash + Eq + Clone + Ord, V: Clone> ChunkedReadOnlyHashMap<K, V> {
-    pub fn new(base: HashMap<K, V>, chunk_size: usize) -> Self {
-        let total_len = base.len();
-        let num_chunks = total_len / chunk_size + 1;
-        let chunked_entries = base
-            .into_iter()
-            .sorted_by_key(|x| x.0.clone())
-            .chunks(chunk_size);
-        let chunks: Vec<HashMap<K, V>> = (&chunked_entries)
-            .into_iter()
-            .map(|chunk| HashMap::from_iter(chunk))
-            .collect();
-        assert!(num_chunks == chunks.len());
-        Self { chunks, total_len }
-    }
-
-    pub fn get_chunk_index(&self, key: &K) -> Option<usize> {
-        for (i, chunk) in self.chunks.iter().enumerate() {
-            if chunk.contains_key(key) {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    pub fn get(&self, key: K) -> Option<V> {
-        let idx = self.get_chunk_index(&key)?;
-        self.chunks[idx].get(&key).cloned()
-    }
-
-    pub fn get_chunk_at_index(&self, idx: usize) -> Option<&HashMap<K, V>> {
-        if idx < self.chunks.len() {
-            return Some(&self.chunks[idx]);
-        }
-        None
-    }
-}
-
-#[get("/all/<page>")]
-fn all(
-    page: usize,
-    state: &State<ClientLibrary>,
-) -> std::result::Result<Json<AllSongsPage>, Status> {
-    if page >= state.songs.chunks.len() as usize {
-        return Err(Status::BadRequest);
-    }
-    Ok(Json(AllSongsPage {
-        page,
-        songs: state
-            .songs
-            .get_chunk_at_index(page)
-            .ok_or(Status::InternalServerError)?
-            .iter()
-            .map(|(key, val)| (key.clone(), val.clone()))
-            .collect(),
-    }))
-}
-
-#[derive(Serialize)]
-struct Info {
-    max_page: usize,
-}
-
-#[get("/info")]
-fn info(state: &State<ClientLibrary>) -> Json<Info> {
-    Json(Info {
-        max_page: state.songs.chunks.len() - 1,
-    })
-}
-
-#[get("/analysis/<path>")]
-fn analysis(
-    path: &str,
-    state: &State<ClientLibrary>,
-) -> std::result::Result<Json<Vec<f32>>, NotFound<String>> {
-    Ok(Json(
-        state
-            .songs
-            .get(path.into())
-            .context("Song does not exist in bliss database")
-            .map_err(|e| NotFound(e.to_string()))?,
-    ))
-}
-
-#[derive(Serialize)]
-struct ClientPlaylist {
-    head: BareBlissSong,
-    tail: Vec<BareBlissSong>,
-}
-
-#[get("/playlist/<path>?<length>")]
-fn playlist(
-    path: &str,
-    length: usize,
-    state: &State<ClientLibrary>,
-) -> std::result::Result<Json<ClientPlaylist>, BadRequest<String>> {
-    let bliss_sort =
-        |x: &[BlissSong<()>], y: &[BlissSong<()>], z| -> Box<dyn Iterator<Item = BlissSong<()>>> {
-            Box::new(closest_to_songs(x, y, z))
-        };
-    let full_song_path = PathBuf::new();
-    let full_song_path = full_song_path
-        .join(state.mpd_library.bliss.config.mpd_base_path.clone())
-        .join(path);
-    let playlist: Vec<BareBlissSong> = state
-        .mpd_library
-        .bliss
-        .playlist_from_custom(
-            &[full_song_path
-                .to_str()
-                .ok_or(BadRequest("Couldn't convert path to full path".into()))?],
-            &euclidean_distance,
-            bliss_sort,
-            true,
-        )
-        .context("while building bliss playlist")
-        .map_err(|e| BadRequest(e.to_string()))?
-        .take(length)
-        .map(|library_song| library_song.bliss_song)
-        .collect();
-
-    Ok(Json(ClientPlaylist {
-        head: playlist[0].clone(),
-        tail: playlist[1..].to_vec(),
-    }))
 }
 
 struct PinnedSong(MPDSong);
@@ -318,18 +170,22 @@ async fn main() -> Result<()> {
                     println!("No genre available, defaulting to bliss analysis queueing...");
                     pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
+                        10,
                         &euclidean_distance,
                         bliss_sort,
                         true,
                         true,
+                        std::time::Instant::now(),
                     )?)
                 } else {
                     pinned_song = PinnedSong(mpd_library.queue_from_song(
                         &pinned_song.0,
+                        10,
                         &euclidean_distance,
                         genre_sort,
                         true,
                         true,
+                        std::time::Instant::now(),
                     )?)
                 }
             }
@@ -368,10 +224,12 @@ async fn main() -> Result<()> {
             loop {
                 pinned_song = PinnedSong(mpd_library.queue_from_song(
                     &pinned_song.0,
+                    10,
                     &euclidean_distance,
                     bliss_sort,
                     true,
                     true,
+                    std::time::Instant::now(),
                 )?)
             }
         }

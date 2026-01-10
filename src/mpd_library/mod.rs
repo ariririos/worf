@@ -13,8 +13,6 @@ use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use ndarray::{Array1, arr1};
 use noisy_float::prelude::n32;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -25,6 +23,8 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::{collections::HashMap, time::Instant};
+use std::{env, sync::MutexGuard};
 
 // If this were just `trait Duplex: Read + Write {}` and
 // `struct MPDStream(Box<dyn Duplex>)`, I would have to box up every
@@ -430,19 +430,51 @@ impl MPDLibrary {
         }
     }
 
+    fn add_next_song_from_playlist<P>(
+        &self,
+        playlist: &mut P,
+        mpd_conn: &mut MutexGuard<Client<MPDStream>>,
+        history: &mut Vec<String>,
+    ) -> Result<()>
+    where
+        P: Iterator<Item = BlissSong<()>>,
+    {
+        let next_song = playlist.next();
+        let mut mpd_song = self
+            .bliss_song_to_mpd(
+                next_song
+                    .as_ref()
+                    .ok_or(anyhow!("while getting next song from bliss"))?,
+            )
+            .context("while converting bliss path to MPD path")?;
+        history.push(mpd_song.file.clone());
+        let title = mpd_song.title.take();
+        let result = mpd_conn.push(mpd_song);
+        if let Err(e) = result {
+            println!(
+                "Error while pushing song {} to MPD queue, skipping: {e}",
+                title.unwrap_or("Unknown".to_string())
+            );
+        }
+        Ok(())
+    }
+
     /// Continuously queues songs from the MPD library based on similarity to the song passed as
-    /// argument until it reaches the end of the user's library. The distance metric can be customized,
-    /// as well as the sort function. Use the `keep_queue` argument to set the pin whenever a new song(s)
+    /// argument until it reaches the end of the user's library. `queue_length` determines how
+    /// many recommendations will be queued up at a time. The distance metric can be customized,
+    /// as well as the sort function. Use `keep_queue` to set the pin whenever a new song(s)
     /// is queued, but don't immediately overwrite the queue -- useful for queueing playlists and
     /// generating recommendations at the end. May fail if the database connection is dropped, if bliss
     /// fails to create a playlist, or if the song passed in has not been analyzed.
     pub fn queue_from_song<'a, F, I>(
         &self,
         song: &MPDSong,
+        queue_length: u32,
         distance: &'a dyn DistanceMetricBuilder,
         sort_by: F,
         dedup: bool,
         keep_queue: bool,
+        timestamp: Instant,
     ) -> Result<MPDSong>
     where
         F: Fn(&[BlissSong<()>], &[BlissSong<()>], &'a dyn DistanceMetricBuilder) -> I,
@@ -471,25 +503,30 @@ impl MPDLibrary {
             }
         }
 
-        let mut songs_added: Vec<String> = vec![];
+        let mut history: Vec<String> = vec![];
 
-        let next_song = playlist.next();
-        let mut mpd_song = self
-            .bliss_song_to_mpd(
-                next_song
-                    .as_ref()
-                    .ok_or(anyhow!("while getting next song from bliss"))?,
-            )
-            .context("while converting bliss path to MPD path")?;
-        songs_added.push(mpd_song.file.clone());
-        let title = mpd_song.title.take();
-        let result = mpd_conn.push(mpd_song);
-        if let Err(e) = result {
-            println!(
-                "Error while pushing song {} to MPD queue, skipping: {e}",
-                title.unwrap_or("Unknown".to_string())
-            );
+        let status = mpd_conn.status()?;
+
+        let queue_pos = status
+            .song
+            .ok_or(anyhow!("while getting current song position"))?
+            .pos;
+
+        let mut queue_diff = (status.queue_len - queue_pos) as i32;
+
+        if ((status.queue_len > queue_length) && ((queue_length as i32) > queue_diff))
+            || (status.queue_len <= queue_length)
+        {
+            while queue_diff > 0 {
+                self.add_next_song_from_playlist(&mut playlist, &mut mpd_conn, &mut history)?;
+                queue_diff -= 1;
+            }
         }
+
+        println!(
+            "Time to first recommendations: {}ms",
+            timestamp.elapsed().as_millis()
+        );
 
         let mut last_queue = mpd_conn.queue()?;
 
@@ -505,7 +542,7 @@ impl MPDLibrary {
                     // don't restart if the new queue is the old queue plus any of the songs from the generated playlist, otherwise use the currently playing song as the new pin
                     let last_queue_songs: Vec<&MPDSong> = last_queue.iter().collect();
                     let all_songs_same_or_generated = new_queue.iter().all(|song| {
-                        last_queue_songs.contains(&song) || songs_added.contains(&song.file)
+                        last_queue_songs.contains(&song) || history.contains(&song.file)
                     });
                     if !all_songs_same_or_generated {
                         let new_pin = mpd_conn
@@ -548,33 +585,17 @@ impl MPDLibrary {
                     }
                 }
 
+                last_queue = new_queue;
+
                 let queue_pos = status
                     .song
                     .ok_or(anyhow!("while getting current song queue position"))?
                     .pos;
 
-                last_queue = new_queue;
-
-                if (status.queue_len > 1 && queue_pos >= status.queue_len - 1)
-                    || status.queue_len <= 1
+                if (status.queue_len > queue_length && queue_pos >= status.queue_len - queue_length)
+                    || status.queue_len <= queue_length
                 {
-                    let next_song = playlist.next();
-                    let mut mpd_song = self
-                        .bliss_song_to_mpd(
-                            next_song
-                                .as_ref()
-                                .ok_or(anyhow!("while getting next song from bliss"))?,
-                        )
-                        .context("while converting bliss path to MPD path")?;
-                    songs_added.push(mpd_song.file.clone());
-                    let title = mpd_song.title.take();
-                    let result = mpd_conn.push(mpd_song);
-                    if let Err(e) = result {
-                        println!(
-                            "Error while pushing song {} to MPD queue, skipping: {e}",
-                            title.unwrap_or("Unknown".to_string())
-                        );
-                    }
+                    self.add_next_song_from_playlist(&mut playlist, &mut mpd_conn, &mut history)?;
                 }
             }
         }
