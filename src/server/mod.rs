@@ -194,7 +194,7 @@ pub fn playlist(
         .take(length + 1)
         .collect();
 
-    println!("Playlist took {} msecs to generate", now.elapsed().as_millis());
+    println!("Playlist generated in {}ms", now.elapsed().as_millis());
 
     Ok(Json(ClientPlaylist {
         head: playlist[0].clone(),

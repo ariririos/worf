@@ -4,11 +4,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use bliss_audio::{
     AnalysisOptions, Song as BareBlissSong,
     library::{AppConfigTrait, BaseConfig, Library, LibrarySong as BlissSong},
-    playlist::DistanceMetricBuilder,
+    playlist::{DistanceMetricBuilder, euclidean_distance},
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use ffmpeg_decoder::FFmpegDecoder as Decoder;
 use itertools::Itertools;
+use log::debug;
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use ndarray::{Array1, arr1};
 use noisy_float::prelude::n32;
@@ -377,8 +378,8 @@ impl MPDLibrary {
     fn mpd_to_bliss_path(&self, mpd_song: &MPDSong) -> Result<PathBuf> {
         let file = &mpd_song.file;
         let path = file.to_string();
-        let path = &self.bliss.config.mpd_base_path.join(PathBuf::from(&path));
-        Ok(path.to_path_buf())
+        let path = self.bliss.config.mpd_base_path.join(PathBuf::from(&path));
+        Ok(path)
     }
 
     /// Converts an [mpd::song::Song] to a [bliss_audio::library::LibrarySong], if previously analyzed.
@@ -388,6 +389,18 @@ impl MPDLibrary {
             .context("while converting MPD path to bliss path")?;
         let song = self.bliss.song_from_path(&path.to_string_lossy()).ok();
         Ok(song)
+    }
+
+    /// Finds the [bliss_audio::library::LibrarySong] matching a filename, if previously analyzed.
+    fn path_to_bliss_song(&self, filename: &str) -> Result<BlissSong<()>> {
+        self.bliss.song_from_path(
+            &self
+                .bliss
+                .config
+                .mpd_base_path
+                .join(PathBuf::from(filename))
+                .to_string_lossy(),
+        )
     }
 
     /// Converts a [bliss_audio::library::LibrarySong] to an [mpd::song::Song].
@@ -430,34 +443,99 @@ impl MPDLibrary {
         }
     }
 
+    fn print_similarity(&self, next_song: &BlissSong<()>, original_song: &BlissSong<()>) -> () {
+        let Some(ref next_title) = next_song.bliss_song.title else {
+            println!("Can't get similarity (couldn't get next song title)");
+            return;
+        };
+        let Some(ref current_title) = original_song.bliss_song.title else {
+            println!("Can't get simliarity (couldn't get original song title)");
+            return;
+        };
+        println!(
+            "Similarity of queued song ({}) to pin ({}): {:.2}%",
+            next_title,
+            current_title,
+            100.0
+                - euclidean_distance(
+                    &original_song.bliss_song.analysis.as_arr1(),
+                    &next_song.bliss_song.analysis.as_arr1()
+                ) * 100.0
+        );
+    }
+
     fn add_next_song_from_playlist<P>(
         &self,
         playlist: &mut P,
         mpd_conn: &mut MutexGuard<Client<MPDStream>>,
         history: &mut Vec<String>,
+        distance: u32,
+        original_song: &BlissSong<()>,
+        print_similarity: bool,
     ) -> Result<()>
     where
         P: Iterator<Item = BlissSong<()>>,
     {
-        let next_song = playlist.next();
+        let next_song_object = playlist.next();
+        let next_song = next_song_object
+            .as_ref()
+            .ok_or(anyhow!("while getting next song from bliss"))?;
         let mut mpd_song = self
-            .bliss_song_to_mpd(
-                next_song
-                    .as_ref()
-                    .ok_or(anyhow!("while getting next song from bliss"))?,
-            )
+            .bliss_song_to_mpd(next_song)
             .context("while converting bliss path to MPD path")?;
         history.push(mpd_song.file.clone());
+        if print_similarity {
+            self.print_similarity(next_song, original_song);
+        }
         let title = mpd_song.title.take();
         let result = mpd_conn.push(mpd_song);
         if let Err(e) = result {
             println!(
                 "Error while pushing song {} to MPD queue, skipping: {e}",
-                title.unwrap_or("Unknown".to_string())
+                title.clone().unwrap_or("Unknown".to_string())
             );
         }
+        debug!(
+            "Queued song {}, distance = {}",
+            title.unwrap_or("Unknown".to_string()),
+            distance
+        );
         Ok(())
     }
+
+    /*
+    pub fn save_playlist<'a, F, I>(
+        &self,
+        song: &MPDSong,
+        playlist_length: u32,
+        distance: &'a dyn DistanceMetricBuilder,
+        sort_by: F,
+        dedup: bool,
+    ) -> Result<()>
+    where
+        F: Fn(&[BlissSong<()>], &[BlissSong<()>], &'a dyn DistanceMetricBuilder) -> I,
+        I: Iterator<Item = BlissSong<()>> + 'a,
+    {
+        let mut mpd_conn = self.mpd_conn.lock().expect("Poisoned lock");
+        let path = self.bliss.config.mpd_base_path.join(&song.file);
+        let mut playlist = self
+            .bliss
+            .playlist_from_custom(&[&path.to_string_lossy().clone()], distance, sort_by, dedup)
+            .context("while building bliss playlist")?
+            .skip(1)
+            .take(playlist_length as usize);
+
+        // TODO:
+        // 1) add playlist to MPD
+        // 2) come up with a way to uniquely identify playlists. do they have any metadata fields? if not,
+        // can a hash based on the initial song be integrated into the playlist name somehow?
+        // 3) refuse to generate a playlist if it already exists, only update the existing one
+        // 4) wait for a specified time and update again, forever
+        // 5) instead of waiting forever, branch off a thread each time this function is called with a different song
+        // to allow for multiple watches
+        Ok(())
+    }
+    */
 
     /// Continuously queues songs from the MPD library based on similarity to the song passed as
     /// argument until it reaches the end of the user's library. `queue_length` determines how
@@ -474,6 +552,7 @@ impl MPDLibrary {
         sort_by: F,
         dedup: bool,
         keep_queue: bool,
+        print_similarity: bool,
         timestamp: Instant,
     ) -> Result<MPDSong>
     where
@@ -482,11 +561,13 @@ impl MPDLibrary {
     {
         let mut mpd_conn = self.mpd_conn.lock().expect("Poisoned lock");
         let path = self.bliss.config.mpd_base_path.join(&song.file);
+        let bliss_song = self.path_to_bliss_song(&song.file)?;
         let mut playlist = self
             .bliss
             .playlist_from_custom(&[&path.to_string_lossy().clone()], distance, sort_by, dedup)
             .context("while building bliss playlist")?
             .skip(1);
+        // let sorted_songs = sort_by(song);
 
         let current_pos = song
             .place
@@ -512,13 +593,25 @@ impl MPDLibrary {
             .ok_or(anyhow!("while getting current song position"))?
             .pos;
 
-        let mut queue_diff = (status.queue_len - queue_pos) as i32;
+        let mut queue_diff = if queue_length > (status.queue_len - queue_pos + 1) {
+            queue_length - (status.queue_len - queue_pos + 1)
+        } else {
+            0
+        };
 
-        if ((status.queue_len > queue_length) && ((queue_length as i32) > queue_diff))
+        if ((status.queue_len > queue_length) && (queue_length > queue_diff))
             || (status.queue_len <= queue_length)
         {
             while queue_diff > 0 {
-                self.add_next_song_from_playlist(&mut playlist, &mut mpd_conn, &mut history)?;
+                self.add_next_song_from_playlist(
+                    &mut playlist,
+                    &mut mpd_conn,
+                    &mut history,
+                    // sort_by(song, peekable_playlist.peek().unwrap(), distance),
+                    0,
+                    &bliss_song,
+                    print_similarity,
+                )?;
                 queue_diff -= 1;
             }
         }
@@ -595,7 +688,15 @@ impl MPDLibrary {
                 if (status.queue_len > queue_length && queue_pos >= status.queue_len - queue_length)
                     || status.queue_len <= queue_length
                 {
-                    self.add_next_song_from_playlist(&mut playlist, &mut mpd_conn, &mut history)?;
+                    self.add_next_song_from_playlist(
+                        &mut playlist,
+                        &mut mpd_conn,
+                        &mut history,
+                        // sort_by,
+                        0,
+                        &bliss_song,
+                        print_similarity,
+                    )?;
                 }
             }
         }

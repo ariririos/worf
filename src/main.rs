@@ -10,6 +10,13 @@
 // - Move beyond just using bliss and integrate last.fm similar artists and/or genre tags.
 // - In a separate thread, keep the bliss database updated as new songs are added to MPD.
 // - Ultimately, the idea of keeping state about the "pin" requires a whole new MPD client -- none of the current ones have an idea of "song radio", "artist radio", etc.
+// - some method of keeping track of skips, replays, etc. and some method of integrating them into the playlist
+// - I would love to integrate information from the whosampled database
+// - genre sort is the same exact playlist for any two songs with the same genre tags; integrate secondary bliss sorting somehow (maybe do it in chunks of 100 or something)
+// - would be nice to have a way to exclude a song from recommendations completely
+// - restart with current song as pin on SIGHUP
+// - switch between genres/bliss/future modes with SIGUSR1
+// - is there some way to do caching? but you immediately run into a cache invalidation at the next update; maybe the update thread will be responsible for updating the cache?
 
 mod mpd_library;
 mod server;
@@ -54,6 +61,9 @@ struct Args {
     #[arg(short, long)]
     /// Path of genre map JSON file
     genres_path: Option<PathBuf>,
+    #[arg(short = 's', long)]
+    /// Print track similarity percentages (only for `daemon`)
+    print_similarity: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -175,6 +185,7 @@ async fn main() -> Result<()> {
                         bliss_sort,
                         true,
                         true,
+                        args.print_similarity,
                         std::time::Instant::now(),
                     )?)
                 } else {
@@ -185,6 +196,7 @@ async fn main() -> Result<()> {
                         genre_sort,
                         true,
                         true,
+                        args.print_similarity,
                         std::time::Instant::now(),
                     )?)
                 }
@@ -229,6 +241,7 @@ async fn main() -> Result<()> {
                     bliss_sort,
                     true,
                     true,
+                    args.print_similarity,
                     std::time::Instant::now(),
                 )?)
             }
