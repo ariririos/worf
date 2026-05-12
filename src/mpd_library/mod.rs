@@ -1,15 +1,16 @@
 mod ffmpeg_decoder;
 
+use crate::NUM_GENRE_FEATURES;
 use anyhow::{Context, Result, anyhow, bail};
 use bliss_audio::{
     AnalysisOptions, Song as BareBlissSong,
-    library::{AppConfigTrait, BaseConfig, Library, LibrarySong as BlissSong},
+    library::{AppConfigTrait, BaseConfig, Library, LibrarySong as BlissSongNoInfo},
     playlist::{DistanceMetricBuilder, euclidean_distance},
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use ffmpeg_decoder::FFmpegDecoder as Decoder;
 use itertools::Itertools;
-use log::debug;
+use log::{debug, info};
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use ndarray::{Array1, arr1};
 use noisy_float::prelude::n32;
@@ -26,6 +27,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Instant};
 use std::{env, sync::MutexGuard};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExtraInfo {
+    pub popularity: i32,
+}
+
+pub type BlissSong = BlissSongNoInfo<ExtraInfo>;
 
 // If this were just `trait Duplex: Read + Write {}` and
 // `struct MPDStream(Box<dyn Duplex>)`, I would have to box up every
@@ -129,6 +137,10 @@ pub fn closest_to_genre_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
     metric_builder: &'a dyn DistanceMetricBuilder,
     track_weights: &GenreWeights,
 ) -> impl Iterator<Item = T> + 'a {
+    assert!(
+        !track_weights.is_empty(),
+        "Likely tried to call genre_sort under `daemon`"
+    );
     let initial_songs: Vec<Array1<f32>> = initial_songs
         .iter()
         .filter_map(|c| {
@@ -153,6 +165,7 @@ pub fn closest_to_genre_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
 ///
 /// If `N` is not exactly equal to the length of `v`, then this function returns `None`.
 /// Copied from rust/library/core/src/slice/mod.rs
+/// https://github.com/rust-lang/rust/issues/133508
 #[inline]
 #[must_use]
 pub const fn slice_as_array<const N: usize, T>(v: &[T]) -> Option<&[T; N]> {
@@ -167,8 +180,10 @@ pub const fn slice_as_array<const N: usize, T>(v: &[T]) -> Option<&[T; N]> {
     }
 }
 
-/// A mapping of genre names to a 5-tuple of weights along the axes from everynoise.com: (organicness/mechanicity, etherealness/spikiness, energy, dynamic variation, instrumentalness). (see https://www.furia.com/page.cgi?type=log&id=419 for the last three values). The 5-tuple is a Vec for now until variadics make it into the language, because I want to keep support for genre weights with different numbers of features.
-pub type GenreWeights = HashMap<String, Vec<f32>>;
+type GenreName = String;
+/// A mapping of genre names to a 5-tuple of weights along the axes from everynoise.com: (organicness/mechanicity, etherealness/spikiness, energy, dynamic variation, instrumentalness). (see https://www.furia.com/page.cgi?type=log&id=419 for the last three values).
+/// (The 5-tuple is a Vec for now until variadics make it into the language, because I want to keep support for genre weights with different numbers of features.)
+pub type GenreWeights = HashMap<GenreName, Vec<f32>>;
 
 /// A mapping of track names to calculated genre weights from a Eucliean average of their genre names. Might make sense to customize the averaging function in the future.
 type TrackWeights = HashMap<String, Vec<f32>>;
@@ -297,8 +312,8 @@ impl MPDLibrary {
         }
     }
 
-    // Gets all songs from MPD. May fail if the MPD connection is dropped.
-    pub fn get_all_mpd_songs(&self) -> Result<Vec<String>> {
+    /// Gets all songs from MPD as [MPDSong]. May fail if MPD connection is dropped.
+    fn get_all_mpd_songs_full(&self) -> Result<Vec<MPDSong>> {
         let mut songs = vec![];
         let mut query = Query::new();
         let query = query.and(Term::File, "");
@@ -312,19 +327,49 @@ impl MPDLibrary {
             if search.is_empty() {
                 break;
             }
-            songs.extend(search.into_iter().map(|s| s.file.to_owned()).map(|s| {
-                String::from(
-                    Path::new(&self.bliss.config.mpd_base_path)
-                        .join(Path::new(&s))
-                        .to_str()
-                        .expect(format!("Song path not valid Unicode: {s}").as_str()),
-                )
-            }));
+            songs.extend(search);
             index += chunk_size;
-            songs.sort();
             songs.dedup();
         }
         Ok(songs)
+    }
+
+    pub fn get_songs_extra_info(&self) -> Result<Vec<(String, ExtraInfo)>> {
+        let all_songs = self.get_all_mpd_songs_full()?;
+        let mut all_songs_extra_info = vec![];
+        let mut default_pop = 0;
+        for song in all_songs {
+            all_songs_extra_info.push((
+                String::from(
+                    Path::new(&self.bliss.config.mpd_base_path)
+                        .join(Path::new(&song.file))
+                        .to_str()
+                        .unwrap_or_else(|| panic!("Song path not valid Unicode: {}", song.file)),
+                ),
+                ExtraInfo {
+                    popularity: song
+                        .tags
+                        .iter()
+                        .find(|(tag_name, _)| tag_name.eq_ignore_ascii_case("comment"))
+                        .map(|(_, pop_val)| {
+                            serde_json::from_str::<ExtraInfo>(pop_val)
+                                .expect("while parsing comment tag as json")
+                                .popularity
+                        })
+                        .unwrap_or_else(|| {
+                            default_pop += 1;
+                            0
+                        }),
+                },
+            ))
+        }
+        Ok(all_songs_extra_info)
+    }
+
+    // Updates bliss database with new songs from MPD. May fail if the database connection is dropped, if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will typically continue even if individual songs fail.
+    pub fn update(&mut self) -> Result<()> {
+        self.bliss
+            .update_library_extra_info(self.get_songs_extra_info()?, true, true)
     }
 
     /// Analyzes all songs in MPD's database with bliss. May fail if the database connection is dropped,
@@ -367,10 +412,10 @@ impl MPDLibrary {
         }
         drop(songs_query);
         drop(sqlite_conn);
-        self.bliss.analyze_paths(
-            self.get_all_mpd_songs()
-                .context("while getting all MPD songs")?,
+        self.bliss.analyze_paths_extra_info(
+            self.get_songs_extra_info()?,
             true,
+            AnalysisOptions::default(),
         )
     }
 
@@ -383,7 +428,7 @@ impl MPDLibrary {
     }
 
     /// Converts an [mpd::song::Song] to a [bliss_audio::library::LibrarySong], if previously analyzed.
-    pub fn mpd_to_bliss_song(&self, mpd_song: &MPDSong) -> Result<Option<BlissSong<()>>> {
+    pub fn mpd_to_bliss_song(&self, mpd_song: &MPDSong) -> Result<Option<BlissSong>> {
         let path = self
             .mpd_to_bliss_path(mpd_song)
             .context("while converting MPD path to bliss path")?;
@@ -392,7 +437,7 @@ impl MPDLibrary {
     }
 
     /// Finds the [bliss_audio::library::LibrarySong] matching a filename, if previously analyzed.
-    fn path_to_bliss_song(&self, filename: &str) -> Result<BlissSong<()>> {
+    fn path_to_bliss_song(&self, filename: &str) -> Result<BlissSong> {
         self.bliss.song_from_path(
             &self
                 .bliss
@@ -404,7 +449,7 @@ impl MPDLibrary {
     }
 
     /// Converts a [bliss_audio::library::LibrarySong] to an [mpd::song::Song].
-    fn bliss_song_to_mpd(&self, song: &BlissSong<()>) -> Result<MPDSong> {
+    fn bliss_song_to_mpd(&self, song: &BlissSong) -> Result<MPDSong> {
         let path = song.bliss_song.path.to_owned();
         let path = path
             .strip_prefix(&*self.bliss.config.mpd_base_path.to_string_lossy())
@@ -431,7 +476,7 @@ impl MPDLibrary {
                             .expect("Poisoned lock")
                             .wait(&[mpd::Subsystem::Queue])
                             .context("while waiting on events from MPD")?;
-                        if next_event.len() > 0 && next_event[0] == mpd::Subsystem::Queue {
+                        if !next_event.is_empty() && next_event[0] == mpd::Subsystem::Queue {
                             return self.get_current_song();
                         }
                     }
@@ -443,25 +488,51 @@ impl MPDLibrary {
         }
     }
 
-    fn print_similarity(&self, next_song: &BlissSong<()>, original_song: &BlissSong<()>) -> () {
-        let Some(ref next_title) = next_song.bliss_song.title else {
-            println!("Can't get similarity (couldn't get next song title)");
-            return;
-        };
-        let Some(ref current_title) = original_song.bliss_song.title else {
-            println!("Can't get simliarity (couldn't get original song title)");
-            return;
-        };
-        println!(
-            "Similarity of queued song ({}) to pin ({}): {:.2}%",
-            next_title,
-            current_title,
-            100.0
-                - euclidean_distance(
-                    &original_song.bliss_song.analysis.as_arr1(),
-                    &next_song.bliss_song.analysis.as_arr1()
-                ) * 100.0
-        );
+    fn get_bliss_similarity(&self, next_song: &BlissSong, original_song: &BlissSong) -> f32 {
+        100.0
+            - euclidean_distance(
+                &original_song.bliss_song.analysis.as_arr1(),
+                &next_song.bliss_song.analysis.as_arr1(),
+            ) * 100.0
+    }
+
+    fn get_genre_similarity(
+        &self,
+        next_song: &BlissSong,
+        original_song: &BlissSong,
+    ) -> Result<f32> {
+        let genre_weights = self.genre_weights.as_ref().ok_or(anyhow!(
+            "Genre weights not found, likely forgot to call `get_track_genre_weights`"
+        ))?;
+        Ok(100.0
+            - euclidean_distance(
+                &arr1(
+                    slice_as_array::<NUM_GENRE_FEATURES, f32>(
+                        &collapse_genres::<NUM_GENRE_FEATURES>(
+                            genre_weights,
+                            original_song
+                                .bliss_song
+                                .genre
+                                .clone()
+                                .context("while getting original song genre")?,
+                        ),
+                    )
+                    .context("while converting genre weight slice to array")?,
+                ),
+                &arr1(
+                    slice_as_array::<NUM_GENRE_FEATURES, f32>(
+                        &collapse_genres::<NUM_GENRE_FEATURES>(
+                            genre_weights,
+                            next_song
+                                .bliss_song
+                                .genre
+                                .clone()
+                                .context("while getting next song genre")?,
+                        ),
+                    )
+                    .context("while converting genre weight slice to array")?,
+                ),
+            ) * 100.0)
     }
 
     fn add_next_song_from_playlist<P>(
@@ -470,11 +541,10 @@ impl MPDLibrary {
         mpd_conn: &mut MutexGuard<Client<MPDStream>>,
         history: &mut Vec<String>,
         distance: u32,
-        original_song: &BlissSong<()>,
-        print_similarity: bool,
+        original_song: &BlissSong,
     ) -> Result<()>
     where
-        P: Iterator<Item = BlissSong<()>>,
+        P: Iterator<Item = BlissSong>,
     {
         let next_song_object = playlist.next();
         let next_song = next_song_object
@@ -484,9 +554,33 @@ impl MPDLibrary {
             .bliss_song_to_mpd(next_song)
             .context("while converting bliss path to MPD path")?;
         history.push(mpd_song.file.clone());
-        if print_similarity {
-            self.print_similarity(next_song, original_song);
-        }
+        info!(
+            "Bliss similarity of next song ({}) to pin ({}): {:.2}%",
+            next_song
+                .bliss_song
+                .title
+                .as_ref()
+                .unwrap_or(&"Unknown".into()),
+            original_song
+                .bliss_song
+                .title
+                .as_ref()
+                .unwrap_or(&"Unknown".into()),
+            self.get_bliss_similarity(next_song, original_song)
+        );
+        info!(
+            "Next song genres: {}",
+            next_song
+                .bliss_song
+                .genre
+                .as_ref()
+                .unwrap_or(&"Unknown".into())
+        );
+        info!(
+            "Genre similarity: {:?}",
+            self.get_genre_similarity(next_song, original_song)
+        );
+        info!("Popularity: {}", next_song.extra_info.popularity);
         let title = mpd_song.title.take();
         let result = mpd_conn.push(mpd_song);
         if let Err(e) = result {
@@ -513,8 +607,8 @@ impl MPDLibrary {
         dedup: bool,
     ) -> Result<()>
     where
-        F: Fn(&[BlissSong<()>], &[BlissSong<()>], &'a dyn DistanceMetricBuilder) -> I,
-        I: Iterator<Item = BlissSong<()>> + 'a,
+        F: Fn(&[BlissSong], &[BlissSong], &'a dyn DistanceMetricBuilder) -> I,
+        I: Iterator<Item = BlissSong> + 'a,
     {
         let mut mpd_conn = self.mpd_conn.lock().expect("Poisoned lock");
         let path = self.bliss.config.mpd_base_path.join(&song.file);
@@ -533,6 +627,7 @@ impl MPDLibrary {
         // 4) wait for a specified time and update again, forever
         // 5) instead of waiting forever, branch off a thread each time this function is called with a different song
         // to allow for multiple watches
+        // 6) option to allow for shuffling the playlist within some initial window (whether by # of songs or by similarity %)
         Ok(())
     }
     */
@@ -544,30 +639,39 @@ impl MPDLibrary {
     /// is queued, but don't immediately overwrite the queue -- useful for queueing playlists and
     /// generating recommendations at the end. May fail if the database connection is dropped, if bliss
     /// fails to create a playlist, or if the song passed in has not been analyzed.
-    pub fn queue_from_song<'a, F, I>(
+    pub fn queue_from_song<'a, F, G, I>(
         &self,
         song: &MPDSong,
         queue_length: u32,
         distance: &'a dyn DistanceMetricBuilder,
         sort_by: F,
+        mut filter_by: Option<G>,
         dedup: bool,
         keep_queue: bool,
-        print_similarity: bool,
         timestamp: Instant,
     ) -> Result<MPDSong>
     where
-        F: Fn(&[BlissSong<()>], &[BlissSong<()>], &'a dyn DistanceMetricBuilder) -> I,
-        I: Iterator<Item = BlissSong<()>> + 'a,
+        F: Fn(&[BlissSong], &[BlissSong], &'a dyn DistanceMetricBuilder) -> I,
+        G: for<'b> FnMut(&'b BlissSong, &'b BlissSong) -> bool,
+        I: Iterator<Item = BlissSong> + 'a,
     {
         let mut mpd_conn = self.mpd_conn.lock().expect("Poisoned lock");
         let path = self.bliss.config.mpd_base_path.join(&song.file);
         let bliss_song = self.path_to_bliss_song(&song.file)?;
+        info!("Pin popularity: {}", bliss_song.extra_info.popularity);
+        let filter = |s: &BlissSong| {
+            if let Some(ref mut filter_fn) = filter_by {
+                filter_fn(s, &bliss_song)
+            } else {
+                true
+            }
+        };
         let mut playlist = self
             .bliss
             .playlist_from_custom(&[&path.to_string_lossy().clone()], distance, sort_by, dedup)
             .context("while building bliss playlist")?
+            .filter(filter)
             .skip(1);
-        // let sorted_songs = sort_by(song);
 
         let current_pos = song
             .place
@@ -593,30 +697,22 @@ impl MPDLibrary {
             .ok_or(anyhow!("while getting current song position"))?
             .pos;
 
-        let mut queue_diff = if queue_length > (status.queue_len - queue_pos + 1) {
-            queue_length - (status.queue_len - queue_pos + 1)
-        } else {
-            0
-        };
+        let mut queue_diff = queue_length.saturating_sub(status.queue_len - queue_pos + 1);
 
-        if ((status.queue_len > queue_length) && (queue_length > queue_diff))
-            || (status.queue_len <= queue_length)
-        {
+        if (status.queue_len <= queue_length) || (queue_length > queue_diff) {
             while queue_diff > 0 {
                 self.add_next_song_from_playlist(
                     &mut playlist,
                     &mut mpd_conn,
                     &mut history,
-                    // sort_by(song, peekable_playlist.peek().unwrap(), distance),
                     0,
                     &bliss_song,
-                    print_similarity,
                 )?;
                 queue_diff -= 1;
             }
         }
 
-        println!(
+        info!(
             "Time to first recommendations: {}ms",
             timestamp.elapsed().as_millis()
         );
@@ -628,7 +724,7 @@ impl MPDLibrary {
                 .wait(&[mpd::Subsystem::Queue])
                 .context("while waiting on events from MPD")?;
 
-            if next_event.len() > 0 && next_event[0] == mpd::Subsystem::Queue {
+            if !next_event.is_empty() && next_event[0] == mpd::Subsystem::Queue {
                 let status = mpd_conn.status()?;
                 let new_queue = mpd_conn.queue()?;
                 if new_queue.len() != last_queue.len() {
@@ -685,8 +781,7 @@ impl MPDLibrary {
                     .ok_or(anyhow!("while getting current song queue position"))?
                     .pos;
 
-                if (status.queue_len > queue_length && queue_pos >= status.queue_len - queue_length)
-                    || status.queue_len <= queue_length
+                if status.queue_len <= queue_length || queue_pos >= status.queue_len - queue_length
                 {
                     self.add_next_song_from_playlist(
                         &mut playlist,
@@ -695,7 +790,6 @@ impl MPDLibrary {
                         // sort_by,
                         0,
                         &bliss_song,
-                        print_similarity,
                     )?;
                 }
             }
@@ -708,9 +802,9 @@ impl MPDLibrary {
         &mut self,
         genres_path: Option<PathBuf>,
     ) -> Result<TrackWeights> {
-        let all_bliss_songs = self
+        let all_bliss_songs: Vec<BlissSong> = self
             .bliss
-            .songs_from_library::<()>()
+            .songs_from_library()
             .context("while getting bliss library")?;
 
         let genre_weights: GenreWeights = serde_json::from_reader(

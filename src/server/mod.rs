@@ -42,7 +42,7 @@ impl<K: Hash + Eq + Clone + Ord, V: Clone> ChunkedReadOnlyHashMap<K, V> {
             .chunks(chunk_size);
         let chunks: Vec<HashMap<K, V>> = (&chunked_entries)
             .into_iter()
-            .map(|chunk| HashMap::from_iter(chunk))
+            .map(HashMap::from_iter)
             .collect();
         assert!(num_chunks == chunks.len());
         Self { chunks, total_len }
@@ -75,7 +75,7 @@ pub fn all(
     page: usize,
     state: &State<ClientLibrary>,
 ) -> std::result::Result<Json<AllSongsPage>, Status> {
-    if page >= state.songs.chunks.len() as usize {
+    if page >= state.songs.chunks.len() {
         return Err(Status::BadRequest);
     }
     Ok(Json(AllSongsPage {
@@ -175,7 +175,7 @@ pub fn playlist(
             ClientPlaylistSong {
                 path: bliss_song
                     .path
-                    .strip_prefix(state.mpd_library.bliss.config.mpd_base_path.to_path_buf())
+                    .strip_prefix(&state.mpd_library.bliss.config.mpd_base_path)
                     .context("while stripping MPD base path from song path")
                     .unwrap()
                     .to_path_buf(),
