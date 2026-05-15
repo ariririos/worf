@@ -1,6 +1,6 @@
 mod ffmpeg_decoder;
 
-use crate::NUM_GENRE_FEATURES;
+use crate::{NUM_BLISS_FEATURES, NUM_GENRE_FEATURES};
 use anyhow::{Context, Result, anyhow, bail};
 use bliss_audio::{
     AnalysisOptions, Song as BareBlissSong,
@@ -10,7 +10,7 @@ use bliss_audio::{
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use ffmpeg_decoder::FFmpegDecoder as Decoder;
 use itertools::Itertools;
-use log::{debug, info};
+use log::{debug, info, warn};
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use ndarray::{Array1, arr1};
 use noisy_float::prelude::n32;
@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Instant};
 use std::{env, sync::MutexGuard};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ExtraInfo {
     pub popularity: i32,
 }
@@ -110,85 +110,111 @@ fn average(v: &[f32]) -> f32 {
     }
 }
 
-fn vec_avg<const N: usize>(v: Vec<Vec<f32>>) -> Vec<f32> {
-    (0..N)
-        .map(|i| average(&v.iter().map(|arr| arr[i]).collect::<Vec<_>>()))
-        .collect()
+fn genre_vec_avg(v: Vec<[f32; NUM_GENRE_FEATURES]>) -> Vec<f32> {
+    v.iter().map(|arr| average(&arr[..])).collect()
 }
 
-pub fn collapse_genres<const N: usize>(genre_weights: &GenreWeights, genres: String) -> Vec<f32> {
+pub fn pad_slice<const N: usize>(v: &[f32]) -> [f32; N] {
+    assert!(
+        v.len() <= N,
+        "length of slice to pad {} must be less than final length {}",
+        v.len(),
+        N
+    );
+    let mut result = [0.0; N];
+    result[..v.len()].copy_from_slice(v);
+    result
+}
+
+pub fn collapse_genres_pad_to<const N: usize>(
+    genre_weights: &GenreWeights,
+    genres: String,
+) -> [f32; N] {
+    assert!(
+        !genre_weights.is_empty(),
+        "Likely tried to call collapse_genres under `daemon`"
+    );
+    assert!(
+        N >= NUM_GENRE_FEATURES,
+        "Cannot pad to a length less than number of genre features"
+    );
     if genres.is_empty() {
-        vec![0.0; N]
+        [0.0; N]
     } else {
-        vec_avg::<N>(
-            genres
-                .split(",")
-                .filter_map(|genre| genre_weights.get(genre))
-                .map(|weights| weights.to_owned())
-                .collect::<Vec<_>>(),
-        )
+        let genres_vec: Vec<_> = genres.split(",").collect();
+        let genres_vec: Vec<_> = genres_vec
+            .into_iter()
+            .filter_map(|genre| genre_weights.get(genre))
+            .map(|weights| weights.to_owned())
+            .collect();
+        let result = if genres_vec.len() as f32 * NUM_GENRE_FEATURES as f32 <= N as f32 {
+            // use full genre weights
+            genres_vec.into_iter().flatten().collect()
+        } else {
+            // collapse each genre into one feature
+            genre_vec_avg(genres_vec)
+        };
+        if result.len() > N {
+            info!(
+                "Clipping genre features with length {} to fit into array of length {}",
+                result.len(),
+                N
+            );
+            result[..N].try_into().unwrap_or([0.0; N])
+        } else {
+            pad_slice(&result)
+        }
     }
 }
 
-/// A modified version of the bliss default playlist creator, sorting by genre weights.
+pub fn collapse_genres(genre_weights: &GenreWeights, genres: String) -> [f32; NUM_BLISS_FEATURES] {
+    collapse_genres_pad_to(genre_weights, genres)
+}
+
+/// A modified version of the bliss default playlist creator, sorting by genre weights and using bliss similarity as a tiebreaker.
 pub fn closest_to_genre_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
     initial_songs: &[T],
     candidate_songs: &[T],
     metric_builder: &'a dyn DistanceMetricBuilder,
-    track_weights: &GenreWeights,
+    track_weights: &TrackWeights,
 ) -> impl Iterator<Item = T> + 'a {
     assert!(
         !track_weights.is_empty(),
         "Likely tried to call genre_sort under `daemon`"
     );
-    let initial_songs: Vec<Array1<f32>> = initial_songs
+    let initial_songs_bliss_weights: Vec<Array1<f32>> = initial_songs
         .iter()
-        .filter_map(|c| {
-            Some(arr1(
-                track_weights.get(&*c.as_ref().path.to_string_lossy())?,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let metric = metric_builder.build(&initial_songs);
+        .map(|c| c.as_ref().analysis.as_arr1())
+        .collect();
+    let bliss_metric = metric_builder.build(&initial_songs_bliss_weights);
+    let initial_songs_genre_weights: Vec<Array1<f32>> = initial_songs
+        .iter()
+        .filter_map(|c| Some(arr1(track_weights.get(&*c.as_ref().path)?)))
+        .collect();
+    let genre_metric = metric_builder.build(&initial_songs_genre_weights);
     let mut candidate_songs = candidate_songs.to_vec();
     candidate_songs.sort_by_cached_key(|song| {
-        n32(metric.distance(&arr1(
-            track_weights
-                .get(&*song.as_ref().path.to_string_lossy())
-                .unwrap_or(&vec![0.0; 5]),
-        )))
+        (
+            n32(genre_metric.distance(&arr1(
+                track_weights
+                    .get(&*song.as_ref().path)
+                    .unwrap_or(&[0.0; NUM_BLISS_FEATURES]),
+            ))),
+            n32(bliss_metric.distance(&song.as_ref().analysis.as_arr1())),
+        )
     });
     candidate_songs.into_iter()
 }
 
-/// Gets a reference to the underlying array.
-///
-/// If `N` is not exactly equal to the length of `v`, then this function returns `None`.
-/// Copied from rust/library/core/src/slice/mod.rs
-/// https://github.com/rust-lang/rust/issues/133508
-#[inline]
-#[must_use]
-pub const fn slice_as_array<const N: usize, T>(v: &[T]) -> Option<&[T; N]> {
-    if v.len() == N {
-        let ptr = v.as_ptr().cast();
-
-        // SAFETY: The underlying array of a slice can be reinterpreted as an actual array `[T; N]` if `N` is not greater than the slice's length.
-        let me = unsafe { &*ptr };
-        Some(me)
-    } else {
-        None
-    }
-}
-
 type GenreName = String;
-/// A mapping of genre names to a 5-tuple of weights along the axes from everynoise.com: (organicness/mechanicity, etherealness/spikiness, energy, dynamic variation, instrumentalness). (see https://www.furia.com/page.cgi?type=log&id=419 for the last three values).
-/// (The 5-tuple is a Vec for now until variadics make it into the language, because I want to keep support for genre weights with different numbers of features.)
-pub type GenreWeights = HashMap<GenreName, Vec<f32>>;
+/// A mapping of genre names to an array of weights along the axes from everynoise.com: (organicness/mechanicity, etherealness/spikiness, energy, dynamic variation, instrumentalness). (see https://www.furia.com/page.cgi?type=log&id=419 for the last three values).
+pub type GenreWeights = HashMap<GenreName, [f32; NUM_GENRE_FEATURES]>;
 
+type TrackPath = PathBuf;
 /// A mapping of track names to calculated genre weights from a Eucliean average of their genre names. Might make sense to customize the averaging function in the future.
-type TrackWeights = HashMap<String, Vec<f32>>;
+type TrackWeights = HashMap<TrackPath, [f32; NUM_BLISS_FEATURES]>;
 
-/// The main struct which holds the [bliss_audio::library::Library] and [mpd::Client]. Also holds the [GenreWeights] if present.
+/// The main struct which holds the bliss library and MPD connection. Also holds the genre weights if present.
 pub struct MPDLibrary {
     pub bliss: Library<Config, Decoder>,
     pub mpd_conn: Arc<Mutex<Client<MPDStream>>>,
@@ -258,7 +284,9 @@ impl MPDLibrary {
         Ok(client)
     }
 
-    /// Build a new MPDLibrary. May fail if paths provided don't exist or if an error occurs connecting to MPD.
+    /// Build a new MPDLibrary.
+    ///
+    /// May fail if paths provided don't exist or if an error occurs connecting to MPD.
     /// If no paths are provided for `config_path` or `database_path`, bliss will default to locations in
     /// $XDG_CONFIG_HOME.
     pub fn build(
@@ -289,7 +317,9 @@ impl MPDLibrary {
         })
     }
 
-    /// Retrieve an existing MPDLibrary from disk. May panic if path provided doesn't exist or if an error occurs
+    /// Retrieve an existing MPDLibrary from disk.
+    ///
+    /// May panic if path provided doesn't exist or if an error occurs
     /// connecting to MPD. If no path is provided, bliss will look up a configuration in $XDG_CONFIG_HOME.
     pub fn retrieve(config_path: Option<PathBuf>) -> Result<Self> {
         let maybe_library = Self::maybe_retrieve(config_path);
@@ -312,7 +342,7 @@ impl MPDLibrary {
         }
     }
 
-    /// Gets all songs from MPD as [MPDSong]. May fail if MPD connection is dropped.
+    /// Get all songs from MPD as [MPDSong]. May fail if MPD connection is dropped.
     fn get_all_mpd_songs_full(&self) -> Result<Vec<MPDSong>> {
         let mut songs = vec![];
         let mut query = Query::new();
@@ -334,6 +364,9 @@ impl MPDLibrary {
         Ok(songs)
     }
 
+    /// Get extra info for all songs.
+    ///
+    /// May fail if MPD connection is dropped.
     pub fn get_songs_extra_info(&self) -> Result<Vec<(String, ExtraInfo)>> {
         let all_songs = self.get_all_mpd_songs_full()?;
         let mut all_songs_extra_info = vec![];
@@ -352,8 +385,8 @@ impl MPDLibrary {
                         .iter()
                         .find(|(tag_name, _)| tag_name.eq_ignore_ascii_case("comment"))
                         .map(|(_, pop_val)| {
-                            serde_json::from_str::<ExtraInfo>(pop_val)
-                                .expect("while parsing comment tag as json")
+                            serde_json::from_str(pop_val)
+                                .unwrap_or_else(|_| { warn!("Couldn't parse comment tag as json at {}, tag contents: {pop_val}, using default", song.file); ExtraInfo::default() })
                                 .popularity
                         })
                         .unwrap_or_else(|| {
@@ -366,13 +399,17 @@ impl MPDLibrary {
         Ok(all_songs_extra_info)
     }
 
-    // Updates bliss database with new songs from MPD. May fail if the database connection is dropped, if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will typically continue even if individual songs fail.
+    /// Update bliss database with new songs from MPD.
+    ///
+    /// May fail if the database connection is dropped, if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will typically continue even if individual songs fail.
     pub fn update(&mut self) -> Result<()> {
         self.bliss
             .update_library_extra_info(self.get_songs_extra_info()?, true, true)
     }
 
-    /// Analyzes all songs in MPD's database with bliss. May fail if the database connection is dropped,
+    /// Analyze all songs in MPD's database with bliss.
+    ///
+    /// May fail if the database connection is dropped,
     /// if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will
     /// typically continue even if individual songs fail.
     pub fn populate(&mut self) -> Result<()> {
@@ -393,7 +430,7 @@ impl MPDLibrary {
                 io::stdin()
                     .read_line(&mut answer)
                     .expect("Failed to read answer");
-                let answer: char = match answer.trim().to_uppercase().parse::<char>() {
+                let answer: char = match answer.trim().to_uppercase().parse() {
                     Ok(ch) => ch,
                     Err(_) => continue,
                 };
@@ -419,7 +456,7 @@ impl MPDLibrary {
         )
     }
 
-    /// Gets the bliss path of an [mpd::song::Song] by prepending the MPD base path.
+    /// Get the bliss path of an MPD song by prepending the MPD base path.
     fn mpd_to_bliss_path(&self, mpd_song: &MPDSong) -> Result<PathBuf> {
         let file = &mpd_song.file;
         let path = file.to_string();
@@ -427,7 +464,7 @@ impl MPDLibrary {
         Ok(path)
     }
 
-    /// Converts an [mpd::song::Song] to a [bliss_audio::library::LibrarySong], if previously analyzed.
+    /// Convert an MPD song to a bliss song, if previously analyzed.
     pub fn mpd_to_bliss_song(&self, mpd_song: &MPDSong) -> Result<Option<BlissSong>> {
         let path = self
             .mpd_to_bliss_path(mpd_song)
@@ -436,7 +473,7 @@ impl MPDLibrary {
         Ok(song)
     }
 
-    /// Finds the [bliss_audio::library::LibrarySong] matching a filename, if previously analyzed.
+    /// Find the bliss song matching a filename, if previously analyzed.
     fn path_to_bliss_song(&self, filename: &str) -> Result<BlissSong> {
         self.bliss.song_from_path(
             &self
@@ -448,7 +485,7 @@ impl MPDLibrary {
         )
     }
 
-    /// Converts a [bliss_audio::library::LibrarySong] to an [mpd::song::Song].
+    /// Convert a bliss song to an MPD song.
     fn bliss_song_to_mpd(&self, song: &BlissSong) -> Result<MPDSong> {
         let path = song.bliss_song.path.to_owned();
         let path = path
@@ -460,7 +497,7 @@ impl MPDLibrary {
         })
     }
 
-    /// Retrieves the currently playing song, or waits for one to become available. Needs exclusive access to the [MPDLibrary::mpd_conn].
+    /// Retrieve the currently playing song, or wait for one to become available. Needs exclusive access to the MPD connection.
     pub fn get_current_song(&self) -> Result<MPDSong> {
         let current_song = self.mpd_conn.lock().expect("Poisoned lock").currentsong();
         match current_song {
@@ -489,11 +526,18 @@ impl MPDLibrary {
     }
 
     fn get_bliss_similarity(&self, next_song: &BlissSong, original_song: &BlissSong) -> f32 {
-        100.0
-            - euclidean_distance(
-                &original_song.bliss_song.analysis.as_arr1(),
-                &next_song.bliss_song.analysis.as_arr1(),
-            ) * 100.0
+        debug!(
+            "Original song features: {:?}",
+            original_song.bliss_song.analysis.as_arr1()
+        );
+        debug!(
+            "Next song features: {:?}",
+            next_song.bliss_song.analysis.as_arr1()
+        );
+        euclidean_distance(
+            &original_song.bliss_song.analysis.as_arr1(),
+            &next_song.bliss_song.analysis.as_arr1(),
+        )
     }
 
     fn get_genre_similarity(
@@ -501,37 +545,27 @@ impl MPDLibrary {
         next_song: &BlissSong,
         original_song: &BlissSong,
     ) -> Result<f32> {
-        let genre_weights = self.genre_weights.as_ref().ok_or(anyhow!(
+        let original_genre_weights = self.genre_weights.as_ref().ok_or(anyhow!(
             "Genre weights not found, likely forgot to call `get_track_genre_weights`"
         ))?;
         Ok(100.0
             - euclidean_distance(
-                &arr1(
-                    slice_as_array::<NUM_GENRE_FEATURES, f32>(
-                        &collapse_genres::<NUM_GENRE_FEATURES>(
-                            genre_weights,
-                            original_song
-                                .bliss_song
-                                .genre
-                                .clone()
-                                .context("while getting original song genre")?,
-                        ),
-                    )
-                    .context("while converting genre weight slice to array")?,
-                ),
-                &arr1(
-                    slice_as_array::<NUM_GENRE_FEATURES, f32>(
-                        &collapse_genres::<NUM_GENRE_FEATURES>(
-                            genre_weights,
-                            next_song
-                                .bliss_song
-                                .genre
-                                .clone()
-                                .context("while getting next song genre")?,
-                        ),
-                    )
-                    .context("while converting genre weight slice to array")?,
-                ),
+                &arr1(&collapse_genres(
+                    original_genre_weights,
+                    original_song
+                        .bliss_song
+                        .genre
+                        .clone()
+                        .context("while getting original song genre")?,
+                )),
+                &arr1(&collapse_genres(
+                    original_genre_weights,
+                    next_song
+                        .bliss_song
+                        .genre
+                        .clone()
+                        .context("while getting next song genre")?,
+                )),
             ) * 100.0)
     }
 
@@ -540,7 +574,6 @@ impl MPDLibrary {
         playlist: &mut P,
         mpd_conn: &mut MutexGuard<Client<MPDStream>>,
         history: &mut Vec<String>,
-        distance: u32,
         original_song: &BlissSong,
     ) -> Result<()>
     where
@@ -555,7 +588,7 @@ impl MPDLibrary {
             .context("while converting bliss path to MPD path")?;
         history.push(mpd_song.file.clone());
         info!(
-            "Bliss similarity of next song ({}) to pin ({}): {:.2}%",
+            "Bliss distance from next song ({}) to pin ({}): {:.2} units",
             next_song
                 .bliss_song
                 .title
@@ -576,12 +609,12 @@ impl MPDLibrary {
                 .as_ref()
                 .unwrap_or(&"Unknown".into())
         );
-        info!(
-            "Genre similarity: {:?}",
-            self.get_genre_similarity(next_song, original_song)
-        );
+        if let Ok(genre_similarity) = self.get_genre_similarity(next_song, original_song) {
+            info!("Genre similarity: {:?}", genre_similarity);
+        }
         info!("Popularity: {}", next_song.extra_info.popularity);
         let title = mpd_song.title.take();
+        let filename = mpd_song.file.clone();
         let result = mpd_conn.push(mpd_song);
         if let Err(e) = result {
             println!(
@@ -589,11 +622,7 @@ impl MPDLibrary {
                 title.clone().unwrap_or("Unknown".to_string())
             );
         }
-        debug!(
-            "Queued song {}, distance = {}",
-            title.unwrap_or("Unknown".to_string()),
-            distance
-        );
+        debug!("Queued song {}", title.unwrap_or(filename),);
         Ok(())
     }
 
@@ -632,13 +661,17 @@ impl MPDLibrary {
     }
     */
 
-    /// Continuously queues songs from the MPD library based on similarity to the song passed as
+    /// Continuously queue songs from the MPD library based on similarity to the song passed as
     /// argument until it reaches the end of the user's library. `queue_length` determines how
     /// many recommendations will be queued up at a time. The distance metric can be customized,
-    /// as well as the sort function. Use `keep_queue` to set the pin whenever a new song(s)
-    /// is queued, but don't immediately overwrite the queue -- useful for queueing playlists and
-    /// generating recommendations at the end. May fail if the database connection is dropped, if bliss
-    /// fails to create a playlist, or if the song passed in has not been analyzed.
+    /// as well as the sort function. A filter function can optionally be provided. Use `keep_queue`
+    /// to set the pin whenever a new song(s) is queued without immediately overwriting the queue --
+    /// useful for queueing playlists and generating recommendations at the end.
+    ///
+    /// May fail if the
+    /// database connection is dropped, if bliss fails to create a playlist, or if the song passed in
+    /// has not been analyzed.
+    #[allow(clippy::too_many_arguments)]
     pub fn queue_from_song<'a, F, G, I>(
         &self,
         song: &MPDSong,
@@ -705,7 +738,6 @@ impl MPDLibrary {
                     &mut playlist,
                     &mut mpd_conn,
                     &mut history,
-                    0,
                     &bliss_song,
                 )?;
                 queue_diff -= 1;
@@ -787,8 +819,6 @@ impl MPDLibrary {
                         &mut playlist,
                         &mut mpd_conn,
                         &mut history,
-                        // sort_by,
-                        0,
                         &bliss_song,
                     )?;
                 }
@@ -796,9 +826,11 @@ impl MPDLibrary {
         }
     }
 
-    /// Loads genre weights from disk and associates them with tracks in the bliss library. May fail if the weights are not found,
+    /// Load genre weights from disk and associate them with tracks in the bliss library.
+    ///
+    /// May fail if the weights are not found,
     /// if they're in the wrong format, or if the bliss library is corrupted.
-    pub fn get_track_genre_weights<const N: usize>(
+    pub fn get_track_genre_weights(
         &mut self,
         genres_path: Option<PathBuf>,
     ) -> Result<TrackWeights> {
@@ -812,23 +844,15 @@ impl MPDLibrary {
                 .context("while opening genre weights json")?,
         )
         .context("while parsing genre weights json")?;
+
         self.genre_weights = Some(genre_weights.clone());
 
         let mut genre_weights_by_track_path: TrackWeights = HashMap::new();
         for song in all_bliss_songs {
             if let Some(genres) = song.bliss_song.genre {
                 genre_weights_by_track_path
-                    .entry(
-                        song.bliss_song
-                            .path
-                            .to_str()
-                            .ok_or(anyhow!(format!(
-                                "Song path not valid Unicode: {:?}",
-                                song.bliss_song.path
-                            )))?
-                            .to_owned(),
-                    )
-                    .or_insert(collapse_genres::<N>(&genre_weights, genres));
+                    .entry(song.bliss_song.path)
+                    .or_insert(collapse_genres(&genre_weights, genres));
             }
         }
         Ok(genre_weights_by_track_path)

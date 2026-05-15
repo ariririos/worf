@@ -1,3 +1,4 @@
+#![deny(clippy::unwrap_used)]
 // Worf
 // * Copyright (c) 2025 Ari Rios <me@aririos.com>
 // * License-SPDX: GPL-3.0-only
@@ -23,12 +24,13 @@ mod mpd_library;
 mod server;
 
 use anyhow::{Context, Result, anyhow, bail};
+use bliss_audio::FeaturesVersion;
 use bliss_audio::playlist::{closest_to_songs, euclidean_distance};
 use clap::{Parser, Subcommand};
 // use futures::stream::StreamExt;
 use itertools::Itertools;
 use mpd::Song as MPDSong;
-use mpd_library::{BlissSong, MPDLibrary, closest_to_genre_songs, collapse_genres, slice_as_array};
+use mpd_library::{BlissSong, MPDLibrary, closest_to_genre_songs, collapse_genres, pad_slice};
 use ndarray::arr1;
 use rocket::Config;
 use rocket::fs::{FileServer, Options, relative};
@@ -41,7 +43,11 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use crate::mpd_library::collapse_genres_pad_to;
+use crate::server::SongAnalyses;
+
 pub const NUM_GENRE_FEATURES: usize = 5;
+pub const NUM_BLISS_FEATURES: usize = FeaturesVersion::LATEST.feature_count();
 const POPULARITY_DIFFERENCE_FLOOR: i32 = 10;
 
 #[derive(Parser, Debug)]
@@ -94,6 +100,7 @@ enum Commands {
 
 struct PinnedSong(MPDSong);
 
+// if we're okay with the mode not switching until after the next MPD queue event, then there's no need to interrupt the MPD idle command
 // fn spawn_update_thread(mpd_conn: Client<MPDStream>) {}
 
 // async fn handle_signals(mut signals: Signals) {
@@ -136,7 +143,7 @@ async fn main() -> Result<()> {
             let mut mpd_library = MPDLibrary::retrieve(config_path.clone())?;
 
             let track_weights = if let Some(Commands::Genres) = args.command {
-                mpd_library.get_track_genre_weights::<NUM_GENRE_FEATURES>(args.genres_path)?
+                mpd_library.get_track_genre_weights(args.genres_path)?
             } else {
                 HashMap::new()
             };
@@ -178,18 +185,26 @@ async fn main() -> Result<()> {
                             .genre
                             .unwrap_or_default(),
                     );
-                    let current_genre_weight = collapse_genres::<NUM_GENRE_FEATURES>(
+                    let current_genre_weight = collapse_genres(
                         &mpd_library
                             .genre_weights
                             .clone()
                             .ok_or(anyhow!("while getting genre weights"))?,
                         // this unwrap is fine because we just set current_genre to Some
-                        current_genre.as_ref().unwrap().clone(),
+                        current_genre
+                            .as_ref()
+                            .ok_or(anyhow!("while getting current genre weight"))?
+                            .clone(),
                     );
                     if let Some(genre) = current_genre.as_ref()
                         && !genre.is_empty()
                     {
-                        println!("Current genre: {}", current_genre.as_ref().unwrap());
+                        println!(
+                            "Current genre: {}",
+                            current_genre
+                                .as_ref()
+                                .ok_or(anyhow!("while getting current genre weight"))?
+                        );
                         println!(
                             "Closest 10 genres: {}",
                             mpd_library
@@ -197,29 +212,13 @@ async fn main() -> Result<()> {
                                 .clone()
                                 .ok_or(anyhow!("while getting genre weights"))?
                                 .iter()
-                                .sorted_by(|a, b| euclidean_distance(
-                                    &arr1(
-                                        slice_as_array::<NUM_GENRE_FEATURES, f32>(
-                                            &current_genre_weight
-                                        )
-                                        .expect("while converting genre weight slice to array")
-                                    ),
-                                    &arr1(
-                                        slice_as_array::<NUM_GENRE_FEATURES, f32>(a.1)
-                                            .expect("while converting genre weight slice to array")
-                                    )
+                                .sorted_by(|&a, b| euclidean_distance(
+                                    &arr1(&current_genre_weight),
+                                    &arr1(&pad_slice::<NUM_BLISS_FEATURES>(a.1))
                                 )
                                 .total_cmp(&euclidean_distance(
-                                    &arr1(
-                                        slice_as_array::<NUM_GENRE_FEATURES, f32>(
-                                            &current_genre_weight
-                                        )
-                                        .expect("while converting genre weight slice to array")
-                                    ),
-                                    &arr1(
-                                        slice_as_array::<NUM_GENRE_FEATURES, f32>(b.1)
-                                            .expect("while converting genre weight slice to array")
-                                    )
+                                    &arr1(&current_genre_weight),
+                                    &arr1(&pad_slice::<NUM_BLISS_FEATURES>(b.1))
                                 )))
                                 .map(|(name, _)| name)
                                 .take(10)
@@ -236,6 +235,7 @@ async fn main() -> Result<()> {
                     println!("Pin has no genre, using bliss similarity");
                 }
 
+                #[allow(clippy::type_complexity)]
                 let sort_fn: Box<
                     dyn Fn(&[BlissSong], &[BlissSong], _) -> Box<dyn Iterator<Item = BlissSong>>,
                 > = if current_genre.as_ref().is_none_or(|genre| genre.is_empty()) {
@@ -265,19 +265,32 @@ async fn main() -> Result<()> {
                 mpd_library.update()?;
             }
 
-            let songs: HashMap<PathBuf, Vec<f32>> = mpd_library
+            mpd_library.get_track_genre_weights(args.genres_path)?;
+
+            let songs = mpd_library
                 .bliss
-                .songs_from_library::<()>()?
+                .songs_from_library()?
                 .iter()
-                .map(|song| {
+                .map(|song: &BlissSong| {
                     (
                         song.bliss_song
                             .path
                             .strip_prefix(&mpd_library.bliss.config.mpd_base_path)
-                            .context("while stripping MPD base path from song path")
-                            .unwrap()
+                            .expect("failed to strip MPD base path")
                             .to_path_buf(),
-                        song.bliss_song.analysis.as_vec(),
+                        SongAnalyses {
+                            bliss: TryInto::<[f32; NUM_BLISS_FEATURES]>::try_into(
+                                song.bliss_song.analysis.as_vec(),
+                            )
+                            .expect("failed to convert bliss features to array"),
+                            genre: collapse_genres_pad_to(
+                                mpd_library
+                                    .genre_weights
+                                    .as_ref()
+                                    .unwrap_or(&HashMap::new()),
+                                song.bliss_song.genre.clone().unwrap_or("".into()),
+                            ),
+                        },
                     )
                 })
                 .collect();

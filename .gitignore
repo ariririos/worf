@@ -2,6 +2,7 @@
 .env
 genres.json
 public/node_modules/*
+worf.log
 
 # Added by cargo
 

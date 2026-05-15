@@ -323,7 +323,7 @@ impl Decoder for FFmpegDecoder {
                         path.display()
                     );
                     drop(tx);
-                    song.sample_array = child.join().unwrap()?;
+                    song.sample_array = child.join().expect("thread panicked")?;
                     return Ok(song);
                 }
                 Err(e) => warn!("{} when decoding file '{}'", e, path.display()),
@@ -362,7 +362,7 @@ impl Decoder for FFmpegDecoder {
                     path.display()
                 );
                 drop(tx);
-                song.sample_array = child.join().unwrap()?;
+                song.sample_array = child.join().expect("thread panicked")?;
                 return Ok(song);
             }
             Err(e) => warn!("error while decoding {}: {}", path.display(), e),
@@ -385,7 +385,7 @@ impl Decoder for FFmpegDecoder {
         }
 
         drop(tx);
-        song.sample_array = child.join().unwrap()?;
+        song.sample_array = child.join().expect("thread panicked")?;
         let duration_seconds = song.sample_array.len() as f32 / SAMPLE_RATE as f32;
         song.duration = Duration::from_nanos((duration_seconds * 1e9_f32).round() as u64);
         Ok(song)

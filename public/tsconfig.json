@@ -1,11 +1,11 @@
 {
     "compilerOptions": {
         "outDir": "./dist/",
-        // "noImplicitAny": true,
-        "module": "es6",
+        "noImplicitAny": true,
+        "module": "node16",
         "target": "es6",
         "allowJs": true,
-        "moduleResolution": "node",
+        "moduleResolution": "node16",
         "resolveJsonModule": true
     }
 }

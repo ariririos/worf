@@ -1,10 +1,12 @@
-use crate::mpd_library::MPDLibrary;
+use crate::{NUM_BLISS_FEATURES, NUM_GENRE_FEATURES};
+use crate::mpd_library::{ExtraInfo, MPDLibrary};
 
 use anyhow::Context;
 use bliss_audio::FeaturesVersion;
-use bliss_audio::library::LibrarySong as BlissSong;
+use bliss_audio::library::LibrarySong as BlissSongNoInfo;
 use bliss_audio::playlist::{closest_to_songs, euclidean_distance};
 use itertools::Itertools;
+use log::info;
 use rocket::response::status::{BadRequest, NotFound};
 use rocket::{State, get, http::Status, serde::json::Json};
 use serde::Serialize;
@@ -13,16 +15,24 @@ use std::hash::Hash;
 use std::path::PathBuf;
 use std::time::Instant;
 
+type BlissSong = BlissSongNoInfo<ExtraInfo>;
+
 pub const CHUNK_SIZE: usize = 50;
+
+#[derive(Serialize, Clone)]
+pub struct SongAnalyses {
+    pub bliss: [f32; NUM_BLISS_FEATURES],
+    pub genre: [f32; NUM_GENRE_FEATURES],
+}
 
 #[derive(Serialize)]
 pub struct AllSongsPage {
     page: usize,
-    songs: Vec<(PathBuf, Vec<f32>)>,
+    songs: HashMap<PathBuf, SongAnalyses>,
 }
 
 pub struct ClientLibrary {
-    pub songs: ChunkedReadOnlyHashMap<PathBuf, Vec<f32>>,
+    pub songs: ChunkedReadOnlyHashMap<PathBuf, SongAnalyses>,
     pub mpd_library: MPDLibrary,
 }
 
@@ -40,7 +50,7 @@ impl<K: Hash + Eq + Clone + Ord, V: Clone> ChunkedReadOnlyHashMap<K, V> {
             .into_iter()
             .sorted_by_cached_key(|x| x.0.clone())
             .chunks(chunk_size);
-        let chunks: Vec<HashMap<K, V>> = (&chunked_entries)
+        let chunks: Vec<_> = (&chunked_entries)
             .into_iter()
             .map(HashMap::from_iter)
             .collect();
@@ -63,11 +73,15 @@ impl<K: Hash + Eq + Clone + Ord, V: Clone> ChunkedReadOnlyHashMap<K, V> {
     }
 
     pub fn get_chunk_at_index(&self, idx: usize) -> Option<&HashMap<K, V>> {
-        if idx < self.chunks.len() {
-            return Some(&self.chunks[idx]);
-        }
-        None
+        self.chunks.get(idx)
     }
+}
+
+#[get("/all")]
+pub fn info(state: &State<ClientLibrary>) -> Json<Info> {
+    Json(Info {
+        max_page: state.songs.chunks.len() - 1,
+    })
 }
 
 #[get("/all/<page>")]
@@ -95,18 +109,11 @@ pub struct Info {
     max_page: usize,
 }
 
-#[get("/info")]
-pub fn info(state: &State<ClientLibrary>) -> Json<Info> {
-    Json(Info {
-        max_page: state.songs.chunks.len() - 1,
-    })
-}
-
 #[get("/analysis/<path>")]
 pub fn analysis(
     path: &str,
     state: &State<ClientLibrary>,
-) -> std::result::Result<Json<Vec<f32>>, NotFound<String>> {
+) -> std::result::Result<Json<SongAnalyses>, NotFound<String>> {
     Ok(Json(
         state
             .songs
@@ -148,10 +155,9 @@ pub fn playlist(
             "Playlist length must be greater than zero".into(),
         ));
     }
-    let bliss_sort =
-        |x: &[BlissSong<()>], y: &[BlissSong<()>], z| -> Box<dyn Iterator<Item = BlissSong<()>>> {
-            Box::new(closest_to_songs(x, y, z))
-        };
+    let bliss_sort = |x: &[BlissSong], y: &[BlissSong], z| -> Box<dyn Iterator<Item = BlissSong>> {
+        Box::new(closest_to_songs(x, y, z))
+    };
     let full_song_path = PathBuf::new();
     let full_song_path = full_song_path
         .join(state.mpd_library.bliss.config.mpd_base_path.clone())
@@ -176,8 +182,7 @@ pub fn playlist(
                 path: bliss_song
                     .path
                     .strip_prefix(&state.mpd_library.bliss.config.mpd_base_path)
-                    .context("while stripping MPD base path from song path")
-                    .unwrap()
+                    .expect("failed to strip MPD base path")
                     .to_path_buf(),
                 artist: bliss_song.artist,
                 title: bliss_song.title,
@@ -194,7 +199,7 @@ pub fn playlist(
         .take(length + 1)
         .collect();
 
-    println!("Playlist generated in {}ms", now.elapsed().as_millis());
+    info!("Playlist generated in {}ms", now.elapsed().as_millis());
 
     Ok(Json(ClientPlaylist {
         head: playlist[0].clone(),
