@@ -14,6 +14,7 @@ use log::{debug, info, warn};
 use mpd::{Client, Idle, Query, Song as MPDSong, Term, search::Window};
 use ndarray::{Array1, arr1};
 use noisy_float::prelude::n32;
+use rocket::tokio::sync::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -24,9 +25,9 @@ use std::os::android::net::SocketAddrExt;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, atomic::Ordering};
 use std::{collections::HashMap, time::Instant};
-use std::{env, sync::MutexGuard};
+use std::{env, sync::atomic::AtomicBool};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ExtraInfo {
@@ -132,7 +133,7 @@ pub fn collapse_genres_pad_to<const N: usize>(
 ) -> [f32; N] {
     assert!(
         !genre_weights.is_empty(),
-        "Likely tried to call collapse_genres under `daemon`"
+        "Likely tried to call collapse_genres under `bliss`"
     );
     assert!(
         N >= NUM_GENRE_FEATURES,
@@ -180,7 +181,7 @@ pub fn closest_to_genre_songs<'a, T: AsRef<BareBlissSong> + Clone + 'a>(
 ) -> impl Iterator<Item = T> + 'a {
     assert!(
         !track_weights.is_empty(),
-        "Likely tried to call genre_sort under `daemon`"
+        "Likely tried to call genre_sort under `bliss`"
     );
     let initial_songs_bliss_weights: Vec<Array1<f32>> = initial_songs
         .iter()
@@ -284,6 +285,26 @@ impl MPDLibrary {
         Ok(client)
     }
 
+    fn reconnect_to_mpd(mpd_conn: &mut MutexGuard<Client<MPDStream>>) {
+        let mut counter = 1;
+        loop {
+            let result = Self::connect_to_mpd();
+            match result {
+                Ok(new_conn) => {
+                    **mpd_conn = new_conn;
+                    println!("Reconnected to MPD!");
+                    break;
+                }
+                Err(_) => {
+                    let backoff = 2_u64.pow(counter);
+                    println!("Reconnecting in {backoff} seconds...");
+                    std::thread::sleep(std::time::Duration::from_secs(backoff));
+                    counter += 1;
+                }
+            }
+        }
+    }
+
     /// Build a new MPDLibrary.
     ///
     /// May fail if paths provided don't exist or if an error occurs connecting to MPD.
@@ -343,7 +364,7 @@ impl MPDLibrary {
     }
 
     /// Get all songs from MPD as [MPDSong]. May fail if MPD connection is dropped.
-    fn get_all_mpd_songs_full(&self) -> Result<Vec<MPDSong>> {
+    async fn get_all_mpd_songs_full(&self) -> Result<Vec<MPDSong>> {
         let mut songs = vec![];
         let mut query = Query::new();
         let query = query.and(Term::File, "");
@@ -352,7 +373,8 @@ impl MPDLibrary {
             let search = self
                 .mpd_conn
                 .lock()
-                .expect("Poisoned lock")
+                .await
+                // .expect("Poisoned lock")
                 .search(query, Window::from((index, index + chunk_size)))?;
             if search.is_empty() {
                 break;
@@ -367,8 +389,8 @@ impl MPDLibrary {
     /// Get extra info for all songs.
     ///
     /// May fail if MPD connection is dropped.
-    pub fn get_songs_extra_info(&self) -> Result<Vec<(String, ExtraInfo)>> {
-        let all_songs = self.get_all_mpd_songs_full()?;
+    pub async fn get_songs_extra_info(&self) -> Result<Vec<(String, ExtraInfo)>> {
+        let all_songs = self.get_all_mpd_songs_full().await?;
         let mut all_songs_extra_info = vec![];
         let mut default_pop = 0;
         for song in all_songs {
@@ -402,9 +424,10 @@ impl MPDLibrary {
     /// Update bliss database with new songs from MPD.
     ///
     /// May fail if the database connection is dropped, if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will typically continue even if individual songs fail.
-    pub fn update(&mut self) -> Result<()> {
+    pub async fn update(&mut self) -> Result<()> {
+        println!("Updating library...");
         self.bliss
-            .update_library_extra_info(self.get_songs_extra_info()?, true, true)
+            .update_library_extra_info(self.get_songs_extra_info().await?, true, true)
     }
 
     /// Analyze all songs in MPD's database with bliss.
@@ -412,45 +435,48 @@ impl MPDLibrary {
     /// May fail if the database connection is dropped,
     /// if the MPD connection is dropped, if the database is corrupted, or if analysis fails. Analysis will
     /// typically continue even if individual songs fail.
-    pub fn populate(&mut self) -> Result<()> {
-        let sqlite_conn = self.bliss.sqlite_conn.lock().expect("Poisoned lock");
-        let mut songs_query = sqlite_conn
-            .prepare("select * from song")
-            .context("while preparing bliss database query")?;
-        let songs_result = songs_query
-            .query([])
-            .context("while querying bliss database")?;
-        let songs_total = songs_result
-            .count()
-            .context("while counting bliss database query results")?;
-        if songs_total > 0 {
-            loop {
-                println!("Database contains data ({songs_total} songs). Continue anyway? (Y/N)");
-                let mut answer = String::new();
-                io::stdin()
-                    .read_line(&mut answer)
-                    .expect("Failed to read answer");
-                let answer: char = match answer.trim().to_uppercase().parse() {
-                    Ok(ch) => ch,
-                    Err(_) => continue,
-                };
-                match answer {
-                    'Y' => {
-                        println!("Continuing...");
-                        break;
+    pub async fn populate(&mut self) -> Result<()> {
+        {
+            // this block needed to not hold sqlite_conn across an `await`
+            let sqlite_conn = self.bliss.sqlite_conn.lock().expect("Poisoned lock");
+            let mut songs_query = sqlite_conn
+                .prepare("select * from song")
+                .context("while preparing bliss database query")?;
+            let songs_result = songs_query
+                .query([])
+                .context("while querying bliss database")?;
+            let songs_total = songs_result
+                .count()
+                .context("while counting bliss database query results")?;
+            if songs_total > 0 {
+                loop {
+                    println!(
+                        "Database contains data ({songs_total} songs). Continue anyway? (Y/N)"
+                    );
+                    let mut answer = String::new();
+                    io::stdin()
+                        .read_line(&mut answer)
+                        .expect("Failed to read answer");
+                    let answer: char = match answer.trim().to_uppercase().parse() {
+                        Ok(ch) => ch,
+                        Err(_) => continue,
+                    };
+                    match answer {
+                        'Y' => {
+                            println!("Continuing...");
+                            break;
+                        }
+                        'N' => {
+                            println!("Aborting!");
+                            bail!("User aborted.");
+                        }
+                        _ => println!("Try again."),
                     }
-                    'N' => {
-                        println!("Aborting!");
-                        bail!("User aborted.");
-                    }
-                    _ => println!("Try again."),
                 }
             }
         }
-        drop(songs_query);
-        drop(sqlite_conn);
         self.bliss.analyze_paths_extra_info(
-            self.get_songs_extra_info()?,
+            self.get_songs_extra_info().await?,
             true,
             AnalysisOptions::default(),
         )
@@ -498,8 +524,8 @@ impl MPDLibrary {
     }
 
     /// Retrieve the currently playing song, or wait for one to become available. Needs exclusive access to the MPD connection.
-    pub fn get_current_song(&self) -> Result<MPDSong> {
-        let current_song = self.mpd_conn.lock().expect("Poisoned lock").currentsong();
+    pub async fn get_current_song(&self) -> Result<MPDSong> {
+        let current_song = self.mpd_conn.lock().await.currentsong();
         match current_song {
             Ok(song) => {
                 if let Some(song) = song {
@@ -510,11 +536,11 @@ impl MPDLibrary {
                         let next_event = self
                             .mpd_conn
                             .lock()
-                            .expect("Poisoned lock")
+                            .await
                             .wait(&[mpd::Subsystem::Queue])
                             .context("while waiting on events from MPD")?;
                         if !next_event.is_empty() && next_event[0] == mpd::Subsystem::Queue {
-                            return self.get_current_song();
+                            return Box::pin(self.get_current_song()).await;
                         }
                     }
                 }
@@ -668,27 +694,30 @@ impl MPDLibrary {
     /// to set the pin whenever a new song(s) is queued without immediately overwriting the queue --
     /// useful for queueing playlists and generating recommendations at the end.
     ///
-    /// May fail if the
-    /// database connection is dropped, if bliss fails to create a playlist, or if the song passed in
-    /// has not been analyzed.
+    /// May fail if the database connection is dropped, if bliss fails to create a playlist, or if
+    /// the song passed in has not been analyzed.
     #[allow(clippy::too_many_arguments)]
-    pub fn queue_from_song<'a, F, G, I>(
-        &self,
+    pub async fn queue_from_song<'a, F, G>(
+        &mut self,
         song: &MPDSong,
         queue_length: u32,
-        distance: &'a dyn DistanceMetricBuilder,
+        distance: &'a (dyn DistanceMetricBuilder + Sync),
         sort_by: F,
         mut filter_by: Option<G>,
         dedup: bool,
         keep_queue: bool,
         timestamp: Instant,
+        update_on_next_loop: Arc<AtomicBool>,
     ) -> Result<MPDSong>
     where
-        F: Fn(&[BlissSong], &[BlissSong], &'a dyn DistanceMetricBuilder) -> I,
+        F: for<'c, 'd, 'e> Fn(
+            &'c [BlissSong],
+            &'d [BlissSong],
+            &'e dyn DistanceMetricBuilder,
+        ) -> Box<dyn Iterator<Item = BlissSong> + 'e>,
         G: for<'b> FnMut(&'b BlissSong, &'b BlissSong) -> bool,
-        I: Iterator<Item = BlissSong> + 'a,
     {
-        let mut mpd_conn = self.mpd_conn.lock().expect("Poisoned lock");
+        let mut mpd_conn = self.mpd_conn.lock().await;
         let path = self.bliss.config.mpd_base_path.join(&song.file);
         let bliss_song = self.path_to_bliss_song(&song.file)?;
         info!("Pin popularity: {}", bliss_song.extra_info.popularity);
@@ -704,7 +733,9 @@ impl MPDLibrary {
             .playlist_from_custom(&[&path.to_string_lossy().clone()], distance, sort_by, dedup)
             .context("while building bliss playlist")?
             .filter(filter)
-            .skip(1);
+            .skip(1)
+            .collect::<Vec<_>>()
+            .into_iter();
 
         let current_pos = song
             .place
@@ -723,26 +754,13 @@ impl MPDLibrary {
 
         let mut history: Vec<String> = vec![];
 
-        let status = mpd_conn.status()?;
-
-        let queue_pos = status
-            .song
-            .ok_or(anyhow!("while getting current song position"))?
-            .pos;
-
-        let mut queue_diff = queue_length.saturating_sub(status.queue_len - queue_pos + 1);
-
-        if (status.queue_len <= queue_length) || (queue_length > queue_diff) {
-            while queue_diff > 0 {
-                self.add_next_song_from_playlist(
-                    &mut playlist,
-                    &mut mpd_conn,
-                    &mut history,
-                    &bliss_song,
-                )?;
-                queue_diff -= 1;
-            }
-        }
+        self.fill_song_queue(
+            &mut mpd_conn,
+            &bliss_song,
+            &mut playlist,
+            &mut history,
+            queue_length,
+        )?;
 
         info!(
             "Time to first recommendations: {}ms",
@@ -752,9 +770,31 @@ impl MPDLibrary {
         let mut last_queue = mpd_conn.queue()?;
 
         loop {
-            let next_event = mpd_conn
+            if update_on_next_loop.load(Ordering::SeqCst) {
+                drop(mpd_conn); // release lock to allow update() to acquire it
+                self.update().await?;
+                mpd_conn = self.mpd_conn.lock().await;
+                println!("Library updated!");
+                update_on_next_loop.store(false, Ordering::SeqCst);
+            }
+            let next_event = match mpd_conn
                 .wait(&[mpd::Subsystem::Queue])
-                .context("while waiting on events from MPD")?;
+                .context("while waiting on events from MPD")
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    println!("MPD connection lost, waiting to reconnect... (error: {e})");
+                    Self::reconnect_to_mpd(&mut mpd_conn);
+                    self.fill_song_queue(
+                        &mut mpd_conn,
+                        &bliss_song,
+                        &mut playlist,
+                        &mut history,
+                        queue_length,
+                    )?; // catch up on changes while disconnected
+                    continue;
+                }
+            };
 
             if !next_event.is_empty() && next_event[0] == mpd::Subsystem::Queue {
                 let status = mpd_conn.status()?;
@@ -824,6 +864,29 @@ impl MPDLibrary {
                 }
             }
         }
+    }
+
+    fn fill_song_queue(
+        &self,
+        mpd_conn: &mut MutexGuard<Client<MPDStream>>,
+        bliss_song: &BlissSong,
+        playlist: &mut std::vec::IntoIter<BlissSong>,
+        history: &mut Vec<String>,
+        queue_length: u32,
+    ) -> Result<()> {
+        let status = mpd_conn.status()?;
+        let queue_pos = status
+            .song
+            .ok_or(anyhow!("while getting current song position"))?
+            .pos;
+        let mut queue_diff = queue_length.saturating_sub(status.queue_len - queue_pos + 1);
+        if (status.queue_len <= queue_length) || (queue_length > queue_diff) {
+            while queue_diff > 0 {
+                self.add_next_song_from_playlist(playlist, mpd_conn, history, bliss_song)?;
+                queue_diff -= 1;
+            }
+        }
+        Ok(())
     }
 
     /// Load genre weights from disk and associate them with tracks in the bliss library.

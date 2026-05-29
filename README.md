@@ -6,6 +6,7 @@ It uses bliss-audio to queue songs that are most similar to the pin. The pin is 
 First, initialize the bliss library if not already done by running `worf --base-path $MPD_BASE_PATH init` in the project root, where `$MPD_BASE_PATH` is where music is stored (can be a network location with username/password).
 Once that's done, run `worf daemon` in the project root to start queueing similar songs.
 Use `worf update` to update the bliss library with new songs from MPD.
+Send `SIGHUP` to worf to switch between bliss mode and genre mode.
 
 ## By genres (experimental!)
 Credit to Glenn McDonald and Spotify for the [Every Noise at Once](https://everynoise.com) project, which provides similarity metrics for Spotify's genre tags. If your music is tagged accordingly, such as with [Zotify](https://github.com/Googolplexed0/zotify) (or my [zotify-tagger](https://github.com/ariririos/zotify-tagger) if you forgot to enable genre tagging), worf can queue music by genre similarity. While this prevents the sort of "drifting" that purely audio-based similarity metrics might cause, in my experience, it often leads to the opposite problem of staying too close in a genre bubble.
@@ -23,3 +24,6 @@ JSON.stringify(weights);
 Worf can use popularity data with the `--popularity-filter` flag; this requires that the library be tagged with popularity data in the comment field (MPD doesn't recognize a popularity tag applied directly).
 
 [zotify-tagger](https://github.com/ariririos/zotify-tagger) can do this with `--tag popularity`.
+
+# Building
+Need to use Rust nightly for `#![feature(closure_lifetime_binder)]`. Use `rustup override set nightly` in project directory to switch.
