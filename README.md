@@ -4,7 +4,7 @@ It uses bliss-audio to queue songs that are most similar to the pin. The pin is 
 
 # Usage
 First, initialize the bliss library if not already done by running `worf --base-path $MPD_BASE_PATH init` in the project root, where `$MPD_BASE_PATH` is where music is stored (can be a network location with username/password).
-Once that's done, run `worf daemon` in the project root to start queueing similar songs.
+Once that's done, run `worf bliss` in the project root to start queueing similar songs.
 Use `worf update` to update the bliss library with new songs from MPD.
 Send `SIGHUP` to worf to switch between bliss mode and genre mode.
 
@@ -25,5 +25,6 @@ Worf can use popularity data with the `--popularity-filter` flag; this requires 
 
 [zotify-tagger](https://github.com/ariririos/zotify-tagger) can do this with `--tag popularity`.
 
-# Building
-Need to use Rust nightly for `#![feature(closure_lifetime_binder)]`. Use `rustup override set nightly` in project directory to switch.
+## Signals
+Use `SIGHUP` to trigger a library update on the next loop (typically, before the next recommendation is queued).
+Use `SIGUSR1` to switch between bliss/genre queueing modes.

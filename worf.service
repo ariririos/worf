@@ -4,7 +4,7 @@ After=network.target
 Requires=mpd.service
 
 [Service]
-ExecStart=%h/.cargo/bin/worf daemon
+ExecStart=%h/.cargo/bin/worf bliss
 
 [Install]
 WantedBy=default.target
