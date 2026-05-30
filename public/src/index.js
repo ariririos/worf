@@ -1,32 +1,41 @@
 // import * as d3 from "d3";
-// import data from "./data.json";
 
-// const width = 1280;
-// const height = 720;
+// const margin = { top: 10, right: 30, bottom: 30, left: 60 },
+//     width = 460 - margin.left - margin.right,
+//     height = 400 - margin.top - margin.bottom;
 
-// const x = d3.scaleLinear().domain([0, 1]).range([0, width]).nice();
-// const y = d3.scaleLinear().domain([0, 1]).range([0, height]).nice();
+// const svg = d3.select("#container")
+//     .append("svg")
+//     .attr("width", width + margin.left + margin.right)
+//     .attr("height", height + margin.top + margin.bottom)
+//     .append("g")
+//     .attr("transform",
+//         "translate(" + margin.left + "," + margin.top + ")");
 
-// const svg = d3.create("svg").attr("viewBox", [0, 0, width, height]).property("value", []);
+// d3.json("http://localhost:8080/api/playlist/Shygirl%2FNymph_o%2F07%20-%20Shygirl%20-%20Playboy%20_%20Positions.ogg?length=20", function (data) {
+//     console.log("data", data);
+//     var x = d3.scaleLinear()
+//         .domain([0, 4000])
+//         .range([0, width]);
+//     svg.append("g")
+//         .attr("transform", "translate(0," + height + ")")
+//         .call(d3.axisBottom(x));
 
-// svg.append("g")
-//     .attr("transform", `translate(0, ${height})`)
-//     .call(d3.axisBottom(x))
-//     .call(g => g.select(".domain").remove());
+//     // Add Y axis
+//     var y = d3.scaleLinear()
+//         .domain([0, 500000])
+//         .range([height, 0]);
+//     svg.append("g")
+//         .call(d3.axisLeft(y));
 
-// svg.append("g")
-//     .attr("transform", `translate(0, 0)`)
-//     .call(d3.axisLeft(y))
-//     .call(g => g.select(".domain").remove());
-
-// const dot = svg.append("g")
-//     .attr("fill", "none")
-//     .attr("stroke", "steelblue")
-//     .attr("stroke-width", 1.5)
-//     .selectAll("circle")
-//     .data(data)
-//     .join("circle")
-//     .attr("transform", d => `translate(${x(d.x)}, ${y(d.y)})`)
-//     .attr("r", 5);
-
-// document.getElementById("container").appendChild(svg.node());
+//     // Add dots
+//     svg.append('g')
+//         .selectAll("dot")
+//         .data(data)
+//         .enter()
+//         .append("circle")
+//         .attr("cx", function (d) { console.log("cx", d); })
+//         .attr("cy", function (d) { console.log("cy", d); })
+//         .attr("r", 1.5)
+//         .style("fill", "#69b3a2")
+// });

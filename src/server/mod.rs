@@ -1,7 +1,7 @@
+use crate::mpd_library::{ExtraInfo, MPDLibrary, collapse_genres_pad_to};
 use crate::{NUM_BLISS_FEATURES, NUM_GENRE_FEATURES};
-use crate::mpd_library::{ExtraInfo, MPDLibrary};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use bliss_audio::FeaturesVersion;
 use bliss_audio::library::LibrarySong as BlissSongNoInfo;
 use bliss_audio::playlist::{closest_to_songs, euclidean_distance};
@@ -133,7 +133,7 @@ pub struct ClientPlaylistSong {
     track_number: Option<i32>,
     disc_number: Option<i32>,
     genre: Option<String>,
-    analysis: Vec<f32>,
+    analysis: SongAnalyses,
     duration: u64,
     features_version: FeaturesVersion,
 }
@@ -158,8 +158,7 @@ pub fn playlist(
     let bliss_sort = |x: &[BlissSong], y: &[BlissSong], z| -> Box<dyn Iterator<Item = BlissSong>> {
         Box::new(closest_to_songs(x, y, z))
     };
-    let full_song_path = PathBuf::new();
-    let full_song_path = full_song_path
+    let full_song_path = PathBuf::new()
         .join(state.mpd_library.bliss.config.mpd_base_path.clone())
         .join(path);
     let now = Instant::now();
@@ -190,8 +189,30 @@ pub fn playlist(
                 album_artist: bliss_song.album_artist,
                 track_number: bliss_song.track_number,
                 disc_number: bliss_song.disc_number,
-                genre: bliss_song.genre,
-                analysis: bliss_song.analysis.as_vec(),
+                genre: bliss_song.genre.clone(),
+                analysis: SongAnalyses {
+                    bliss: *bliss_song
+                        .analysis
+                        .as_vec()
+                        .as_array()
+                        .expect("while converting bliss analysis to array"),
+                    genre: {
+                        let current_genre = Some(bliss_song.genre.unwrap_or_default());
+                        collapse_genres_pad_to(
+                            &state
+                                .mpd_library
+                                .genre_weights
+                                .clone()
+                                .ok_or(anyhow!("while getting genre weights"))
+                                .expect("while getting genre weights"),
+                            current_genre
+                                .as_ref()
+                                .ok_or(anyhow!("while getting current genre weight"))
+                                .expect("while getting current genre weight")
+                                .clone(),
+                        )
+                    },
+                },
                 duration: bliss_song.duration.as_secs(),
                 features_version: bliss_song.features_version,
             }
