@@ -285,7 +285,7 @@ impl MPDLibrary {
         Ok(client)
     }
 
-    fn reconnect_to_mpd(mpd_conn: &mut MutexGuard<Client<MPDStream>>) {
+    pub fn reconnect_to_mpd(mpd_conn: &mut MutexGuard<Client<MPDStream>>) {
         let mut counter = 1;
         loop {
             let result = Self::connect_to_mpd();
@@ -500,7 +500,7 @@ impl MPDLibrary {
     }
 
     /// Find the bliss song matching a filename, if previously analyzed.
-    fn path_to_bliss_song(&self, filename: &str) -> Result<BlissSong> {
+    pub fn path_to_bliss_song(&self, filename: &str) -> Result<BlissSong> {
         self.bliss.song_from_path(
             &self
                 .bliss
@@ -512,7 +512,7 @@ impl MPDLibrary {
     }
 
     /// Convert a bliss song to an MPD song.
-    fn bliss_song_to_mpd(&self, song: &BlissSong) -> Result<MPDSong> {
+    pub fn bliss_song_to_mpd(&self, song: &BlissSong) -> Result<MPDSong> {
         let path = song.bliss_song.path.to_owned();
         let path = path
             .strip_prefix(&*self.bliss.config.mpd_base_path.to_string_lossy())
@@ -919,5 +919,19 @@ impl MPDLibrary {
             }
         }
         Ok(genre_weights_by_track_path)
+    }
+
+    /// Retrieve album art for a song from MPD.
+    ///
+    /// May fail if MPD connection is dropped or song doesn't exist in MPD database.
+    pub async fn get_album_art(&self, song: &MPDSong) -> Result<Vec<u8>> {
+        let mut mpd_conn = self.mpd_conn.lock().await;
+        match mpd_conn
+            .albumart(&song)
+            .context("while getting album art from MPD")
+        {
+            Ok(album_art) => Ok(album_art),
+            Err(_) => Ok(mpd_conn.readpicture(&song)?),
+        }
     }
 }

@@ -7,6 +7,7 @@ use bliss_audio::library::LibrarySong as BlissSongNoInfo;
 use bliss_audio::playlist::{closest_to_songs, euclidean_distance};
 use itertools::Itertools;
 use log::info;
+use rocket::response::Responder;
 use rocket::response::status::{BadRequest, NotFound};
 use rocket::{State, get, http::Status, serde::json::Json};
 use serde::Serialize;
@@ -18,6 +19,11 @@ use std::time::Instant;
 type BlissSong = BlissSongNoInfo<ExtraInfo>;
 
 pub const CHUNK_SIZE: usize = 50;
+
+/// Custom responder for binary image data
+#[derive(Responder)]
+#[response(status = 200, content_type = "image/jpeg")]
+pub struct ImageData(Vec<u8>);
 
 #[derive(Serialize, Clone)]
 pub struct SongAnalyses {
@@ -85,10 +91,7 @@ pub fn info(state: &State<ClientLibrary>) -> Json<Info> {
 }
 
 #[get("/all/<page>")]
-pub fn all(
-    page: usize,
-    state: &State<ClientLibrary>,
-) -> std::result::Result<Json<AllSongsPage>, Status> {
+pub fn all(page: usize, state: &State<ClientLibrary>) -> Result<Json<AllSongsPage>, Status> {
     if page >= state.songs.chunks.len() {
         return Err(Status::BadRequest);
     }
@@ -113,7 +116,7 @@ pub struct Info {
 pub fn analysis(
     path: &str,
     state: &State<ClientLibrary>,
-) -> std::result::Result<Json<SongAnalyses>, NotFound<String>> {
+) -> Result<Json<SongAnalyses>, NotFound<String>> {
     Ok(Json(
         state
             .songs
@@ -123,8 +126,52 @@ pub fn analysis(
     ))
 }
 
+#[get("/albumart/<path>")]
+pub async fn albumart(
+    path: &str,
+    state: &State<ClientLibrary>,
+) -> Result<ImageData, NotFound<String>> {
+    let song = &state
+        .mpd_library
+        .bliss_song_to_mpd(
+            &state
+                .mpd_library
+                .path_to_bliss_song(path)
+                .context("while finding bliss song")
+                .map_err(|e| NotFound(e.to_string()))
+                .unwrap(),
+        )
+        .context("while converting bliss song to MPD song")
+        .map_err(|e| NotFound(e.to_string()))
+        .unwrap();
+    loop {
+        match state.mpd_library.get_album_art(song).await.map(ImageData) {
+            Ok(album_art) => return Ok(album_art),
+            Err(e) => {
+                match e.downcast_ref::<mpd::error::Error>() {
+                    Some(mpd::error::Error::Parse(e)) => {
+                        return Err(NotFound(format!(
+                            "Album art not found for this song: {}",
+                            e
+                        )));
+                    }
+                    _ => {
+                        info!(
+                            "Error retrieving album art: {}, attempting to reconnect...",
+                            e
+                        );
+                    }
+                }
+                MPDLibrary::reconnect_to_mpd(&mut state.mpd_library.mpd_conn.lock().await);
+                continue;
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct ClientPlaylistSong {
+    href: PathBuf,
     path: PathBuf,
     artist: Option<String>,
     title: Option<String>,
@@ -133,6 +180,7 @@ pub struct ClientPlaylistSong {
     track_number: Option<i32>,
     disc_number: Option<i32>,
     genre: Option<String>,
+    popularity: i32,
     analysis: SongAnalyses,
     duration: u64,
     features_version: FeaturesVersion,
@@ -149,7 +197,7 @@ pub fn playlist(
     path: &str,
     length: usize,
     state: &State<ClientLibrary>,
-) -> std::result::Result<Json<ClientPlaylist>, BadRequest<String>> {
+) -> Result<Json<ClientPlaylist>, BadRequest<String>> {
     if length == 0 {
         return Err(BadRequest(
             "Playlist length must be greater than zero".into(),
@@ -178,11 +226,14 @@ pub fn playlist(
         .map(|song| {
             let bliss_song = song.bliss_song;
             ClientPlaylistSong {
-                path: bliss_song
-                    .path
-                    .strip_prefix(&state.mpd_library.bliss.config.mpd_base_path)
-                    .expect("failed to strip MPD base path")
-                    .to_path_buf(),
+                href: bliss_song.path.clone(),
+                path: {
+                    bliss_song
+                        .path
+                        .strip_prefix(state.mpd_library.bliss.config.mpd_base_path.clone())
+                        .expect("Couldn't strip MPD base path")
+                        .to_path_buf()
+                },
                 artist: bliss_song.artist,
                 title: bliss_song.title,
                 album: bliss_song.album,
@@ -190,6 +241,7 @@ pub fn playlist(
                 track_number: bliss_song.track_number,
                 disc_number: bliss_song.disc_number,
                 genre: bliss_song.genre.clone(),
+                popularity: song.extra_info.popularity,
                 analysis: SongAnalyses {
                     bliss: *bliss_song
                         .analysis

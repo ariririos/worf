@@ -36,7 +36,9 @@ use ndarray::arr1;
 use rocket::Config;
 use rocket::fs::{FileServer, Options, relative};
 use rocket::routes;
-use server::{CHUNK_SIZE, ChunkedReadOnlyHashMap, ClientLibrary, all, analysis, info, playlist};
+use server::{
+    CHUNK_SIZE, ChunkedReadOnlyHashMap, ClientLibrary, albumart, all, analysis, info, playlist,
+};
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
@@ -301,10 +303,12 @@ async fn main() -> Result<()> {
                             .expect("failed to strip MPD base path")
                             .to_path_buf(),
                         SongAnalyses {
-                            bliss: TryInto::<[f32; NUM_BLISS_FEATURES]>::try_into(
-                                song.bliss_song.analysis.as_vec(),
-                            )
-                            .expect("failed to convert bliss features to array"),
+                            bliss: *song
+                                .bliss_song
+                                .analysis
+                                .as_vec()
+                                .as_array()
+                                .expect("while converting bliss analysis to array"),
                             genre: collapse_genres_pad_to(
                                 mpd_library
                                     .genre_weights
@@ -353,7 +357,7 @@ async fn main() -> Result<()> {
 
             rocket::custom(figment)
                 .mount("/", FileServer::new(relative!("public"), Options::Index))
-                .mount("/api/", routes![all, info, analysis, playlist])
+                .mount("/api/", routes![all, info, analysis, albumart, playlist])
                 // .register("/", catchers![not_found])
                 .manage(library_interface)
                 .launch()
